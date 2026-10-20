@@ -1,0 +1,59 @@
+/* 固定应用外框，内容与弹窗独立滚动；缩小窗口不裁掉控件。 */
+html,body,#app{height:100%;width:100%}
+body{overflow:hidden}
+.app-shell{height:100dvh;min-height:0;overflow:hidden}
+.sidebar{height:100dvh;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.sidebar-note,.sidebar-bottom{flex-shrink:0}
+main{min-width:0;height:100%;display:flex;flex-direction:column;overflow:hidden}
+.topbar{flex:0 0 66px}
+.content{flex:1;min-height:0;width:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;scrollbar-gutter:stable}
+.content,.modal,.table-panel{scrollbar-width:thin;scrollbar-color:#bdcbb4 transparent}
+.modal{max-height:calc(100dvh - 40px);overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.modal-overlay{padding:20px}
+.table-panel{max-width:100%;overflow-x:auto}
+.runtime-settings{padding:0 25px 24px;color:#859774;font-size:max(.875rem,0.7857rem);line-height:1.9}
+.runtime-settings p{margin-bottom:12px}
+.calendar-day{min-width:0}
+.calendar-event{overflow-wrap:anywhere}
+.page-header>div:first-child{min-width:0}
+.top-actions,.header-actions{flex-shrink:0}
+@media(max-width:1100px){
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .metric-value{font-size:max(.875rem,1.7857rem)}
+  .metric-bottom{min-height:15px}
+  .metrics.three{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .section-title{flex-wrap:wrap}
+  .section-title>.actions{flex-wrap:wrap}
+}
+@media(max-width:950px){
+  .sidebar{width:164px;padding:25px 10px 18px}
+  main{margin-left:164px;width:calc(100% - 164px)}
+  .brand{font-size:max(.875rem,1.1429rem);gap:3px;padding:0}
+  .brand-icon{width:30px}
+  .brand small{font-size:max(.875rem,0.5rem);letter-spacing:.5px}
+  .nav-item{padding:13px 14px}
+  .content{padding:25px 20px 0}
+  .topbar{padding:0 20px}
+  .top-actions{gap:12px}
+  .local-badge{font-size:max(.875rem,0.6429rem)}
+  .page-header{align-items:flex-start;flex-direction:column;gap:18px;margin-bottom:22px}
+  .header-actions{align-self:flex-end}
+  h1{font-size:max(.875rem,1.6429rem)}
+  .dashboard-grid{grid-template-columns:minmax(0,1fr)}
+  .account-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .account-card{padding:18px}
+  .account-amount{font-size:max(.875rem,1.5714rem)}
+  .metrics.three{grid-template-columns:minmax(0,1fr)}
+  .allocation-panel{min-height:300px}
+  .calendar-day{min-height:94px;padding:6px 3px}
+  .calendar-event{font-size:max(.875rem,0.6429rem);padding:3px}
+  .calendar-event small{white-space:normal;font-size:max(.875rem,0.5rem)}
+  .sidebar-note{margin:30px 3px 18px;padding:17px 13px}
+  .tabs{gap:22px}
+  footer{gap:12px;line-height:1.8}
+}
+@media(max-height:700px){
+  .sidebar-note{display:none}
+  .sidebar-bottom{padding-top:22px}
+  .sidebar-bottom>button{margin-bottom:18px}
+}

@@ -1,0 +1,1 @@
+{"identifier":"default","description":"AssetGrove local desktop permissions","windows":["main"],"permissions":["core:default","core:window:allow-set-theme","autostart:default"]}

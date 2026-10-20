@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.py text working-tree-encoding=UTF-8
+*.vue text working-tree-encoding=UTF-8
+*.ts text working-tree-encoding=UTF-8
+*.css text working-tree-encoding=UTF-8
+*.md text working-tree-encoding=UTF-8
+*.json text working-tree-encoding=UTF-8
+*.nsh text working-tree-encoding=UTF-8
