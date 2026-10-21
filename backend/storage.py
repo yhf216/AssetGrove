@@ -50,13 +50,13 @@ class Database:
             db.executescript(SCHEMA)
             db.execute("INSERT INTO meta VALUES('schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
             db.execute("INSERT OR IGNORE INTO meta VALUES('tracking_start',?)", (now().date().isoformat(),))
-            catalog = Path(__file__).parent/'data/a_shares.json'
-            if catalog.exists():
+            for catalog in sorted((Path(__file__).parent/'data').glob('*.json')):
                 data = json.loads(catalog.read_text(encoding='utf-8'))
-                catalog_date = db.execute("SELECT value FROM meta WHERE key='catalog_date'").fetchone()
+                key = 'catalog_date:' + catalog.stem
+                catalog_date = db.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
                 if not catalog_date or catalog_date[0] != data['as_of']:
                     db.executemany('INSERT INTO security_catalog VALUES(?,?) ON CONFLICT(symbol) DO UPDATE SET name=excluded.name',data['securities'].items())
-                    db.execute("INSERT INTO meta VALUES('catalog_date',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(data['as_of'],))
+                    db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,data['as_of']))
 
     def move_to(self, folder):
         target_dir = Path(str(folder).strip()).expanduser()

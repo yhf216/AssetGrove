@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
+import re
 import socket
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from .storage import TZ, now, rows
-from .ledger import cents, decimal, dps_for, uid
+from .ledger import cents, decimal, dps_for, uid, market_prefix, security_name
 from .network import configure_direct_network
 from .bao_transport import BaoTransportError, safe_baostock_transport
 
@@ -142,7 +143,7 @@ def _fetch_packaged(action, payload, timeout):
 
 def _fetch(action, payload):
     symbol = payload.get('symbol', '600036')
-    code = ('sh.' if symbol.startswith('6') else 'sz.') + symbol
+    code = market_prefix(symbol) + '.' + symbol
     if action.startswith('bao_'):
         import baostock as bs
         login = bs.login()
@@ -177,8 +178,19 @@ def _fetch(action, payload):
     import akshare as ak
     if action == 'ak_catalog':
         return ak.stock_info_a_code_name().to_dict('records')
+    if action == 'ak_etf_catalog':
+        return ak.fund_etf_category_sina(symbol='ETF基金').to_dict('records')
+    if action == 'ak_calendar':
+        return ak.tool_trade_date_hist_sina().astype(str).to_dict('records')
+    if action == 'ak_etf_history':
+        frame = ak.fund_etf_hist_em(symbol=symbol, start_date=(now().date()-timedelta(days=365)).strftime('%Y%m%d'), end_date=now().strftime('%Y%m%d'), adjust='')
+        return frame.astype(object).where(frame.notna(),None).to_dict('records')
+    if action == 'ak_etf_dividends':
+        frame = ak.fund_open_fund_info_em(symbol=symbol,indicator='分红送配详情')
+        splits = ak.fund_open_fund_info_em(symbol=symbol,indicator='拆分详情')
+        return {'events':frame.astype(object).where(frame.notna(),None).to_dict('records'), 'has_splits':not splits.empty}
     if action == 'ak_quote_xq':
-        frame = ak.stock_individual_spot_xq(symbol=('SH' if symbol.startswith('6') else 'SZ')+symbol,timeout=12)
+        frame = ak.stock_individual_spot_xq(symbol=market_prefix(symbol).upper()+symbol,timeout=12)
         values = dict(zip(frame['item'],frame['value']))
         price = decimal(values.get('现价',0),positive=True)
         stamp = datetime.fromisoformat(str(values['时间'])).astimezone(TZ) if values.get('时间') else None
@@ -186,22 +198,14 @@ def _fetch(action, payload):
                 'source':'AKShare / 雪球','as_of':stamp.isoformat() if stamp else '',
                 'timestamp_verified':bool(stamp and stamp<=now()+timedelta(minutes=1))}
     if action == 'ak_quote':
-        frame = ak.stock_bid_ask_em(symbol=symbol)
-        values = dict(zip(frame['item'],frame['value']))
-        price = decimal(values.get('最新', values.get('最新价', 0)), positive=True)
-        result = {'symbol':symbol,'price':str(price),'source':'AKShare / 东方财富','as_of':'','timestamp_verified':False}
-        # AKShare 报价表不包含源时间；额外读取同一上游 f86，不能把本机接收时间伪装成报价时间。
-        try:
-            import requests
-            secid = ('1.' if symbol.startswith('6') else '0.') + symbol
-            raw = requests.get('https://push2.eastmoney.com/api/qt/stock/get', params={'secid':secid,'fields':'f43,f58,f59,f86'}).json()['data']
-            upstream_price = decimal(raw['f43']) / (Decimal(10) ** int(raw['f59']))
-            stamp = datetime.fromtimestamp(int(raw['f86']),TZ)
-            if upstream_price == price and stamp <= now()+timedelta(minutes=1):
-                result.update(as_of=stamp.isoformat(),timestamp_verified=True,name=raw.get('f58',symbol))
-        except Exception:
-            pass
-        return result
+        # 同一快照读取价格、精度和源时间；ETF 常用三位小数，不能按 A 股固定精度解析。
+        import requests
+        secid = ('1.' if market_prefix(symbol) == 'sh' else '0.') + symbol
+        raw = requests.get('https://push2.eastmoney.com/api/qt/stock/get', params={'secid':secid,'fields':'f43,f58,f59,f86'}, timeout=12).json()['data']
+        price = decimal(raw['f43'],positive=True) / (Decimal(10) ** int(raw['f59']))
+        stamp = datetime.fromtimestamp(int(raw['f86']),TZ)
+        return {'symbol':symbol,'price':str(price),'source':'AKShare / 东方财富','name':raw.get('f58',symbol),
+                'as_of':stamp.isoformat(),'timestamp_verified':stamp<=now()+timedelta(minutes=1)}
     if action == 'ak_dividends':
         frame = ak.stock_fhps_detail_em(symbol=symbol)
         return frame.astype(object).where(frame.notna(),None).to_dict('records')
@@ -231,16 +235,38 @@ def apply_result(db,action,symbol,result):
         db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET price=excluded.price,as_of=excluded.as_of,received_at=excluded.received_at,source=excluded.source,timestamp_verified=excluded.timestamp_verified', (symbol,data['price'],data['as_of'],now().isoformat(),data['source'],int(data['timestamp_verified'])))
         if data.get('name'):
             db.execute('UPDATE securities SET name=? WHERE symbol=?',(data['name'],symbol))
-    elif action == 'bao_history':
+    elif action in {'bao_history', 'ak_etf_history'}:
+        source = 'BaoStock' if action == 'bao_history' else 'AKShare / 东方财富 ETF'
+        if action == 'ak_etf_history':
+            data = [{'date':clean_date(r.get('日期')), 'close':str(r['收盘'])} for r in data if r.get('收盘') is not None]
         for r in data:
             if r.get('close'):
-                db.execute('INSERT OR REPLACE INTO daily_prices VALUES(?,?,?,?)',(symbol,r['date'],r['close'],'BaoStock'))
+                db.execute('INSERT OR REPLACE INTO daily_prices VALUES(?,?,?,?)',(symbol,r['date'],r['close'],source))
         if data and not db.execute('SELECT 1 FROM quotes WHERE symbol=?',(symbol,)).fetchone():
             r = data[-1]
-            db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?)',(symbol,r['close'],r['date']+'T15:00:00+08:00',now().isoformat(),'BaoStock / 历史收盘',0))
+            db.execute('INSERT INTO quotes VALUES(?,?,?,?,?,?)',(symbol,r['close'],r['date']+'T15:00:00+08:00',now().isoformat(),source+' / 历史收盘',0))
     elif action == 'bao_calendar':
         for r in data:
             status(db,'trading_day:'+r['calendar_date'],r['is_trading_day'])
+    elif action == 'ak_calendar':
+        days = {clean_date(r.get('trade_date')) for r in data}
+        if now().date().isoformat() in days:
+            status(db,'trading_day:'+now().date().isoformat(),'1')
+    elif action == 'ak_etf_dividends':
+        for r in data['events']:
+            ex = clean_date(r.get('除息日'))
+            raw = r.get('每10份分红', r.get('每份分红'))
+            numbers = re.findall(r'(\d+(?:\.\d+)?)\s*元', str(raw))
+            if not ex or not numbers:
+                raise ValueError('ETF 分红字段不完整，未更新覆盖范围')
+            cash = decimal(numbers[-1],positive=True) / (10 if '每10份分红' in r else 1)
+            save_dividend(db,{'symbol':symbol,'report_year':int(ex[:4]),'record_date':clean_date(r.get('权益登记日')),
+                             'ex_date':ex,'pay_date':clean_date(r.get('分红发放日')),'cash_ps':str(cash),
+                             'status':'implemented','source':'AKShare / 天天基金 ETF'})
+        # 该接口返回成立以来全部分红。ETF 以除息年度汇总，不冒充上市公司财年分红。
+        status(db,'dividend_coverage:'+symbol,1990)
+        if data['has_splits']:
+            status(db,'corporate_actions:'+symbol,'存在基金份额折算，多年分红尚未统一份额基准')
     elif action == 'bao_dividends':
         for r in data:
             if not r.get('dividCashPsBeforeTax') or decimal(r['dividCashPsBeforeTax']) <= 0:
@@ -296,7 +322,10 @@ def evaluate_rules(db, emit=lambda value: None):
             checks.append(dps/decimal(q['price'])*100 >= decimal(r['target_yield']))
         hit = bool(checks) and (all(checks) if r['mode']=='all' else any(checks))
         if hit and not r['triggered']:
-            message = {'event':'notification','title':r['symbol']+' 达到关注条件','body':f"最新价 ¥{q['price']} · {r['basis']} · 报价时间 {q['as_of']}"}
+            label = {'ttm':'近12个月','last_year':'1年','avg3':'3年平均','avg5':'5年平均'}.get(r['basis'],r['basis'])
+            dps = dps_for(db,r['symbol'],r['basis'])
+            yield_text = f" · {label}股息率 {dps/decimal(q['price'])*100:.2f}%" if dps is not None else ''
+            message = {'event':'notification','title':security_name(db,r['symbol'])+' 达到关注条件','body':f"{r['symbol']} · 最新价 ¥{q['price']}{yield_text}"}
             db.execute('INSERT INTO notifications VALUES(?,?,?,?,?,0)',(uid(),moment.isoformat(),message['title'],message['body'],r['id']))
             emit(message)
         db.execute('UPDATE rules SET triggered=? WHERE id=?',(int(hit),r['id']))

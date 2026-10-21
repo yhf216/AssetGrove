@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import json
 import re
 import uuid
 from datetime import date, timedelta
@@ -43,9 +44,26 @@ def iso_date(value, allow_future=False):
 
 def symbol_code(value):
     value = str(value).lower().strip().replace('sh.', '').replace('sz.', '')
-    if not re.fullmatch(r'(60\d{4}|68\d{4}|00\d{4}|30\d{4})', value):
-        raise ValueError('首版仅支持沪深 A 股六位代码，例如 600036、000001')
+    if not re.fullmatch(r'(60\d{4}|68\d{4}|00\d{4}|30\d{4}|5[1268]\d{4}|159\d{3})', value):
+        raise ValueError('请输入沪深 A 股或 ETF 六位代码，例如 600036、518880、159915')
     return value
+
+
+def is_etf(symbol):
+    return str(symbol).startswith(('15', '51', '52', '56', '58'))
+
+
+def market_prefix(symbol):
+    return 'sh' if str(symbol).startswith(('5', '6')) else 'sz'
+
+
+def preference(db, key, default):
+    value = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+    return value[0] if value else default
+
+
+def set_preference(db, key, value):
+    db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
 
 
 def security_name(db, symbol, provided=''):
@@ -98,17 +116,30 @@ def replay(db, until=None, validate=False, balances=None):
                     raise ValueError(f"{a['name']} 在 {tx['date']} 余额不足，请先录入期初余额或转入资金")
     return list(accounts.values()), [h for h in holdings.values() if h['quantity'] > 0]
 
-def save_account(db, body):
+def save_account(db, body, account_id=None):
     name = str(body.get('name', '')).strip()[:80]
     if not name or body.get('kind') not in KINDS:
         raise ValueError('请填写账户名称并选择资产类型')
-    aid = uid()
+    aid = account_id or uid()
     rate = decimal(body.get('rate', 0))
     if rate < 0 or rate > 100:
         raise ValueError('年利率应在 0–100% 之间')
     maturity = body.get('maturity', '')
     if maturity:
         maturity = iso_date(maturity, True)
+    if body['kind'] not in {'bond', 'deposit'}:
+        rate, maturity = Decimal(0), ''
+    if account_id:
+        old = db.execute('SELECT * FROM accounts WHERE id=?', (aid,)).fetchone()
+        if not old:
+            raise ValueError('账户不存在')
+        if body['kind'] != 'broker' and db.execute("SELECT 1 FROM transactions WHERE account_id=? AND symbol<>'' LIMIT 1", (aid,)).fetchone():
+            raise ValueError('该账户有证券交易或分红记录，须保留证券账户性质')
+        if body['kind'] not in {'cash', 'broker'} and (db.execute('SELECT 1 FROM cashflows WHERE account_id=? AND enabled=1', (aid,)).fetchone() or db.execute("SELECT 1 FROM transactions WHERE kind='transfer' AND (account_id=? OR to_account_id=?)", (aid, aid)).fetchone()):
+            raise ValueError('该账户关联转账或启用的现金流计划，须保留现金或证券账户性质')
+        db.execute('UPDATE accounts SET name=?,kind=?,rate=?,maturity=? WHERE id=?', (name, body['kind'], str(rate), maturity, aid))
+        audit(db, 'update', 'account:' + aid, dict(old), body)
+        return aid
     db.execute('INSERT INTO accounts VALUES(?,?,?,?,?)', (aid, name, body['kind'], str(rate), maturity))
     amount = cents(body.get('balance', 0))
     if amount < 0:
@@ -265,7 +296,7 @@ def dps_for(db, symbol, basis='ttm'):
     years = {'last_year': 1, 'avg3': 3, 'avg5': 5}.get(basis)
     if not years:
         raise ValueError('未知股息口径')
-    if db.execute('SELECT 1 FROM sync_status WHERE key=?', ('corporate_actions:' + symbol,)).fetchone():
+    if events and db.execute('SELECT 1 FROM sync_status WHERE key=?', ('corporate_actions:' + symbol,)).fetchone():
         return None
     # 没有完整财年覆盖证明时不把数据缺失当作零。
     coverage = db.execute('SELECT value FROM sync_status WHERE key=?', ('dividend_coverage:' + symbol,)).fetchone()
@@ -277,10 +308,21 @@ def dps_for(db, symbol, basis='ttm'):
     selected = [e for e in events if e['report_year'] is not None and today.year-years <= e['report_year'] < today.year]
     return sum((decimal(e['cash_ps']) for e in selected), Decimal(0)) / years
 
+def security_snapshot(db, symbol):
+    quote = db.execute('SELECT * FROM quotes WHERE symbol=?', (symbol,)).fetchone()
+    quote = dict(quote) if quote else None
+    dps = {basis: dps_for(db, symbol, basis) for basis in ['ttm', 'last_year', 'avg3', 'avg5']}
+    return {'symbol': symbol, 'name': security_name(db, symbol), 'quote': quote,
+            'instrument': 'etf' if is_etf(symbol) else 'stock',
+            'dps': {k: float(v) if v is not None else None for k, v in dps.items()},
+            'yields': {k: float(v / decimal(quote['price']) * 100) if quote and v is not None else None for k, v in dps.items()}}
+
+
 def build_state(db):
     reconcile(db)
     balances = {}
     accounts, holdings = replay(db, balances=balances)
+    dividend_basis = preference(db, 'dividend_basis', 'avg3')
     names = {s['symbol']: s['name'] for s in rows(db, 'SELECT * FROM securities')}
     quotes = {q['symbol']: q for q in rows(db, 'SELECT * FROM quotes')}
     stock_value, estimate, estimated_count, missing_dividends = 0, 0, 0, 0
@@ -294,20 +336,33 @@ def build_state(db):
         h['reference_value'] = h['market_value'] if q else money(h.pop('reference_cost_cents'))
         stock_value += cents(h['reference_value'])
         estimated_count += int(q is None)
-        dps = dps_for(db, h['symbol'])
+        dps = dps_for(db, h['symbol'], dividend_basis)
         h['annual_dividend_estimate'] = float(dps * h['quantity']) if dps is not None else None
         missing_dividends += int(dps is None)
         estimate += cents(h['annual_dividend_estimate'] or 0)
         h['yield_ttm'] = float(dps / decimal(q['price']) * 100) if q and dps is not None else None
         h['cost_yield_ttm'] = float(dps / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and dps is not None else None
+        h['dividend_yield'] = h['yield_ttm']
+        h['cost_dividend_yield'] = h['cost_yield_ttm']
+        h['instrument'] = 'etf' if is_etf(h['symbol']) else 'stock'
     broker_cash = sum(a['balance_cents'] for a in accounts if a['kind'] == 'broker')
     allocation = {k: sum(a['balance_cents'] for a in accounts if a['kind'] == k) for k in KINDS}
     allocation['cash'] += allocation.pop('broker')
-    allocation['stock'] = stock_value
+    etf_value = sum(cents(h['reference_value']) for h in holdings if h['instrument'] == 'etf')
+    allocation['fund'] += etf_value
+    allocation['stock'] = stock_value - etf_value
     total = sum(allocation.values())
     for a in accounts:
         a['balance'] = money(a.pop('balance_cents'))
         a['stock_value'] = sum(h['reference_value'] for h in holdings if h['account_id'] == a['id'])
+    order = json.loads(preference(db, 'account_order', '[]'))
+    ranks = {aid: i for i, aid in enumerate(order)}
+    sort_mode = preference(db, 'account_sort', 'manual')
+    accounts.sort(key=lambda a: (ranks.get(a['id'], len(ranks)), a['name'], a['id']))
+    if sort_mode == 'type':
+        accounts.sort(key=lambda a: ['cash', 'broker', 'fund', 'bond', 'deposit'].index(a['kind']))
+    elif sort_mode == 'amount':
+        accounts.sort(key=lambda a: -(a['balance'] + a['stock_value']))
     txs = rows(db, 'SELECT * FROM transactions ORDER BY date DESC,created_at DESC,rowid DESC')
     year = now().year
     dividend_txs = [t for t in txs if t['kind'] in DIVIDEND_KINDS]
@@ -336,7 +391,7 @@ def build_state(db):
                 approximate = True
         timeline.append({'date': day, 'value': money(value), 'estimated': approximate})
     watch = []
-    symbols = sorted({w['symbol'] for w in rows(db, 'SELECT * FROM watchlist')} | {h['symbol'] for h in holdings})
+    symbols = sorted({w['symbol'] for w in rows(db, 'SELECT * FROM watchlist UNION SELECT symbol FROM rules')} | {h['symbol'] for h in holdings})
     for symbol in symbols:
         q = quotes.get(symbol)
         yields, dps = {}, {}
@@ -344,7 +399,7 @@ def build_state(db):
             v = dps_for(db, symbol, basis)
             dps[basis] = float(v) if v is not None else None
             yields[basis] = float(v / decimal(q['price']) * 100) if q and v is not None else None
-        watch.append({'symbol': symbol, 'name': names.get(symbol, symbol), 'quote': q, 'yields': yields, 'dps': dps,
+        watch.append({'symbol': symbol, 'name': names.get(symbol, symbol), 'quote': q, 'yields': yields, 'dps': dps, 'instrument':'etf' if is_etf(symbol) else 'stock',
                       'held': any(h['symbol'] == symbol for h in holdings)})
     for t in txs:
         t['amount'] = money(t['amount'])
@@ -354,6 +409,7 @@ def build_state(db):
     for e in entitlements:
         e['expected_amount'] = money(e['expected_amount'])
     return {'today': now().date().isoformat(), 'tracking_start': tracking_start, 'timeline_start':start, 'accounts': accounts, 'holdings': holdings,
+            'preferences': {'account_sort': sort_mode, 'dividend_basis': dividend_basis},
             'securities':rows(db,'SELECT * FROM securities ORDER BY name'),
             'transactions': txs, 'watchlist': watch, 'dividends': rows(db, 'SELECT * FROM dividends ORDER BY pay_date DESC,ex_date DESC'),
             'entitlements': entitlements, 'rules': rows(db, 'SELECT * FROM rules'), 'cashflows': rows(db, 'SELECT * FROM cashflows'),

@@ -18,7 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .ledger import (build_state, cents, confirm_dividend, decimal, delete_account, delete_transaction, iso_date,
-                     replay, run_cashflows, save_account, save_transaction, security_name, symbol_code, uid)
+                     replay, run_cashflows, save_account, save_transaction, security_name, symbol_code, uid,
+                     is_etf, preference, set_preference, security_snapshot)
 from .providers import apply_result, evaluate_rules, fetch, status
 from .storage import Database, audit, now, rows
 from .network import configure_direct_network
@@ -59,16 +60,20 @@ class Service:
             try:
                 with self.db.connect() as db:
                     status(db,'running','1')
-                    tracked = symbols if symbols is not None else [r['symbol'] for r in rows(db,"SELECT symbol FROM watchlist UNION SELECT DISTINCT symbol FROM transactions WHERE symbol<>''")]
+                    tracked = symbols if symbols is not None else [r['symbol'] for r in rows(db,"SELECT symbol FROM watchlist UNION SELECT symbol FROM rules WHERE enabled=1 UNION SELECT DISTINCT symbol FROM transactions WHERE symbol<>''")]
                 actions = [('bao_calendar',tracked[0] if tracked else '600036')]
                 for symbol in tracked:
                     actions.append(('ak_quote',symbol))
                     if full:
-                        actions.extend((action,symbol) for action in ['bao_history','bao_dividends','ak_dividends'])
+                        actions.extend((action,symbol) for action in (['ak_etf_history','ak_etf_dividends'] if is_etf(symbol) else ['bao_history','bao_dividends','ak_dividends']))
                 for action,symbol in actions:
                     if self.stop.is_set():
                         break
                     result = fetch(action,{'symbol':symbol})
+                    if action == 'bao_calendar' and not result['ok']:
+                        with self.db.connect() as db:
+                            apply_result(db,action,symbol,result)
+                        action, result = 'ak_calendar', fetch('ak_calendar', {'symbol':symbol})
                     with self.db.connect() as db:
                         apply_result(db,action,symbol,result)
                         evaluate_rules(db,emit)
@@ -99,7 +104,8 @@ class Service:
                     status(db,'scheduler_last_tick',now().isoformat())
                     run_cashflows(db)
                     build_state(db)  # 派息日生成待确认到账，不自动增加现金。
-                    tracked = db.execute('SELECT 1 FROM watchlist UNION SELECT 1 FROM transactions WHERE symbol<>\'\' LIMIT 1').fetchone()
+                    tracked = db.execute('SELECT 1 FROM watchlist UNION SELECT 1 FROM rules WHERE enabled=1 UNION SELECT 1 FROM transactions WHERE symbol<>\'\' LIMIT 1').fetchone()
+                    evaluate_rules(db, emit)
                 if tracked:
                     moment = now()
                     market = moment.weekday() < 5 and ('09:30'<=moment.strftime('%H:%M')<='11:30' or '13:00'<=moment.strftime('%H:%M')<='15:00')
@@ -168,6 +174,12 @@ def create_app(database=None, token=None, background=True):
                 if body['theme'] not in {'light','dark','system'}:
                     raise ValueError('无效的外观设置')
                 settings['theme'] = body['theme']
+            with database.connect() as db:
+                for key, allowed in {'account_sort': {'manual','type','amount'}, 'dividend_basis': {'last_year','ttm','avg3','avg5'}}.items():
+                    if key in body:
+                        if body[key] not in allowed:
+                            raise ValueError('无效的排序或股息口径')
+                        set_preference(db, key, body[key])
             write_settings(settings)
         return {'ok':True}
 
@@ -185,6 +197,37 @@ def create_app(database=None, token=None, background=True):
     def accounts(body:dict):
         with database.connect() as db:
             return {'id':save_account(db,body)}
+
+    @app.put('/api/accounts/{account_id}',dependencies=[Depends(auth)])
+    def edit_account(account_id:str, body:dict):
+        with database.connect() as db:
+            return {'id':save_account(db,body,account_id)}
+
+    @app.post('/api/accounts/order',dependencies=[Depends(auth)])
+    def reorder_accounts(body:dict):
+        ids = body.get('ids')
+        with database.connect() as db:
+            existing = {r['id'] for r in rows(db, 'SELECT id FROM accounts')}
+            if not isinstance(ids, list) or not all(isinstance(i,str) for i in ids) or len(ids) != len(existing) or set(ids) != existing:
+                raise ValueError('账户列表已变化，请刷新后重新排序')
+            set_preference(db,'account_order',json.dumps(ids))
+            set_preference(db,'account_sort','manual')
+        return {'ok':True}
+
+    @app.post('/api/securities/prepare',dependencies=[Depends(auth)])
+    def prepare_security(body:dict):
+        symbol = symbol_code(body.get('symbol',''))
+        with database.connect() as db:
+            db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO NOTHING', (symbol, security_name(db,symbol,body.get('name',''))))
+            result = security_snapshot(db,symbol)
+        if background:
+            service.sync(True,[symbol])
+        return result
+
+    @app.get('/api/security/{symbol}',dependencies=[Depends(auth)])
+    def security_details(symbol:str):
+        with database.connect() as db:
+            return security_snapshot(db, symbol_code(symbol))
 
     @app.get('/api/securities/search',dependencies=[Depends(auth)])
     def search_securities(q:str=''):
@@ -258,7 +301,7 @@ def create_app(database=None, token=None, background=True):
         price, yield_value = body.get('target_price'),body.get('target_yield')
         price = str(decimal(price,True)) if price not in (None,'') else None
         yield_value = str(decimal(yield_value,True)) if yield_value not in (None,'') else None
-        basis,mode = body.get('basis','ttm'),body.get('mode','price')
+        basis,mode = body.get('basis','avg3'),body.get('mode','price')
         if mode not in {'price','yield','all'} or basis not in {'ttm','last_year','avg3','avg5'}:
             raise ValueError('请设置价格或股息率条件，并选择有效口径')
         if (mode in {'price','all'} and price is None) or (mode in {'yield','all'} and yield_value is None):
@@ -268,10 +311,12 @@ def create_app(database=None, token=None, background=True):
         elif mode == 'yield':
             price = None
         with database.connect() as db:
-            if not db.execute('SELECT 1 FROM securities WHERE symbol=?',(symbol,)).fetchone():
-                raise ValueError('请先添加该股票到自选或持仓')
+            db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO NOTHING', (symbol,security_name(db,symbol,body.get('name',''))))
             rid = uid()
             db.execute('INSERT INTO rules VALUES(?,?,?,?,?,?,1,0)',(rid,symbol,price,yield_value,basis,mode))
+            evaluate_rules(db, emit)
+        if background:
+            service.sync(True,[symbol])
         return {'ok':True}
 
     @app.delete('/api/rules/{rid}',dependencies=[Depends(auth)])
