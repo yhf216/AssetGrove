@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Trash2 } from 'lucide-vue-next'
+import { Trash2, Pencil, GripVertical } from 'lucide-vue-next'
 
 const props = defineProps<{ rule:any; stock?:any; name:string; basisLabel:string }>()
-defineEmits<{ remove:[] }>()
+defineEmits<{ remove:[]; edit:[]; dragstart:[event:DragEvent]; dragend:[]; move:[step:number] }>()
 const current = computed(() => Number(props.stock?.quote?.price) || null)
 const dps = computed(() => props.stock?.dps?.[props.rule.basis])
 const yieldNow = computed(() => props.stock?.yields?.[props.rule.basis])
@@ -46,6 +46,6 @@ const fresh = computed(() => {
       </div>
       <span class="rule-distance">{{ difference == null ? '等待价格与分红资料' : `目标较当前 ${difference > 0 ? '+' : ''}${percent(difference)}` }}</span>
     </div>
-    <div class="rule-actions"><span class="tag">{{ rule.triggered ? '已提醒' : fresh ? '监控中' : '等待有效行情' }}</span><button class="icon-button" aria-label="删除关注条件" @click="$emit('remove')"><Trash2 :size="17" /></button></div>
+    <div class="rule-actions"><span class="tag">{{ rule.triggered ? '条件达标' : fresh ? '监控中' : '等待有效行情' }}</span><div class="rule-edit-actions"><button class="icon-button rule-drag" draggable="true" :aria-label="'拖动排序 '+rule.symbol" title="拖动排序；方向键调整位置" @dragstart="$emit('dragstart',$event)" @dragend="$emit('dragend')" @keydown.up.prevent="$emit('move',-1)" @keydown.down.prevent="$emit('move',1)"><GripVertical :size="17" /></button><button class="icon-button" :aria-label="'编辑关注条件 '+rule.symbol" @click="$emit('edit')"><Pencil :size="17" /></button><button class="icon-button" aria-label="删除关注条件" @click="$emit('remove')"><Trash2 :size="17" /></button></div></div>
   </article>
 </template>

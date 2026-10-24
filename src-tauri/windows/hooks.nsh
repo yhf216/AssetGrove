@@ -1,5 +1,13 @@
 ; UTF-8. Only remove ledger data when explicitly selected during a real uninstall.
+!macro NSIS_HOOK_POSTINSTALL
+  WriteRegStr HKCU "Software\Classes\AppUserModelId\com.assetgrove.desktop" "DisplayName" "AssetGrove"
+  WriteRegStr HKCU "Software\Classes\AppUserModelId\com.assetgrove.desktop" "IconUri" "$INSTDIR\assetgrove.exe"
+!macroend
+
 !macro NSIS_HOOK_POSTUNINSTALL
+  ${If} $UpdateMode <> 1
+    DeleteRegKey HKCU "Software\Classes\AppUserModelId\com.assetgrove.desktop"
+  ${EndIf}
   ${If} $DeleteAppDataCheckboxState = 1
   ${AndIf} $UpdateMode <> 1
     SetShellVarContext current

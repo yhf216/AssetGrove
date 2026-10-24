@@ -12,6 +12,11 @@ try {
   $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
   [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
   [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+  $identity = 'HKCU:\Software\Classes\AppUserModelId\' + $request.app_id
+  if (-not (Test-Path -LiteralPath $identity)) { New-Item -Path $identity -Force > $null }
+  $registered = Get-ItemProperty -LiteralPath $identity
+  if (-not $registered.DisplayName) { New-ItemProperty -LiteralPath $identity -Name DisplayName -Value 'AssetGrove' -PropertyType String -Force > $null }
+  if (-not $registered.IconUri) { New-ItemProperty -LiteralPath $identity -Name IconUri -Value $request.executable -PropertyType String -Force > $null }
   $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($request.app_id)
   $setting = $notifier.Setting.ToString()
   if ($setting -ne 'Enabled') { throw ('Windows notification setting: ' + $setting) }
@@ -21,8 +26,17 @@ try {
     $xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
     $xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>' + $title + '</text><text>' + $body + '</text></binding></visual><audio src="ms-winsoundevent:Notification.Default"/></toast>')
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+    $toast.Tag = [Guid]::NewGuid().ToString('N').Substring(0,16)
+    $toast.Group = 'AssetGrove'
     $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(10)
     $notifier.Show($toast)
+    $found = $false
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+      $history = [Windows.UI.Notifications.ToastNotificationManager]::History.GetHistory($request.app_id)
+      if ($history | Where-Object { $_.Tag -eq $toast.Tag }) { $found = $true; break }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $found) { throw 'Windows did not retain the toast. Check notification banners and Do Not Disturb settings.' }
   }
   [Console]::Out.Write('Enabled')
 } catch {
@@ -35,7 +49,7 @@ try {
         .creation_flags(0x08000000)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| e.to_string())?;
-    let request = serde_json::json!({"app_id":app.config().identifier,"title":title,"body":body,"test_only":test_only});
+    let request = serde_json::json!({"app_id":app.config().identifier,"title":title,"body":body,"test_only":test_only,"executable":std::env::current_exe().map_err(|e|e.to_string())?.to_string_lossy()});
     child.stdin.take().ok_or("无法连接系统通知服务")?.write_all(request.to_string().as_bytes()).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().map_err(|e| e.to_string())?.is_none() {
@@ -50,7 +64,7 @@ try {
     if !result.status.success() {
         return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
     }
-    Ok(if test_only { "Windows 允许通知" } else { "已提交到 Windows 通知中心" }.into())
+    Ok(if test_only { "Windows 允许通知" } else { "Windows 通知中心已收到消息" }.into())
 }
 
 #[cfg(not(windows))]

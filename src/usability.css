@@ -92,6 +92,9 @@ input[type=checkbox] { accent-color:var(--accent); }
 .target-marker>span { top:1.35rem; color:var(--accent-text); }
 .target-marker i { background:var(--surface); border:2px solid var(--accent-text); }
 .rule-actions { display:flex; flex-direction:column; align-items:center; gap:1rem; }
+.rule-edit-actions { display:flex; gap:.2rem; }
+.rule-drag { cursor:grab; }
+.rule-strip.dragging { opacity:.45; }
 @media(max-width:1250px) {
   .rule-strip { grid-template-columns:minmax(7rem,.7fr) minmax(13rem,1fr) auto; gap:1rem; }
   .rule-values { grid-column:2; grid-row:1; }

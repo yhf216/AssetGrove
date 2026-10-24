@@ -11,6 +11,7 @@ struct Backend {
     connection: Mutex<Option<serde_json::Value>>,
     child: Mutex<Option<CommandChild>>,
     notification_status: Mutex<Option<serde_json::Value>>,
+    opening_pending: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -83,11 +84,23 @@ fn last_notification_status(state: tauri::State<Backend>) -> Option<serde_json::
     state.notification_status.lock().ok()?.clone()
 }
 
+fn flush_opening(app: &tauri::AppHandle) {
+    let state = app.state::<Backend>();
+    let mut pending = state.opening_pending.lock().unwrap();
+    if *pending {
+        if let Some(child) = state.child.lock().unwrap().as_mut() {
+            if child.write(b"opened\n").is_ok() { *pending = false; }
+        }
+    }
+}
+
 fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        *app.state::<Backend>().opening_pending.lock().unwrap() = true;
+        flush_opening(app);
     }
 }
 
@@ -139,6 +152,7 @@ fn main() {
             }
             let (mut receiver, child) = command.spawn()?;
             *app.state::<Backend>().child.lock().unwrap() = Some(child);
+            flush_opening(app.handle());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut pending = Vec::new();
