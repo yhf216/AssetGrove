@@ -48,6 +48,15 @@ class Service:
         self.queued_symbols = set()
         self.queued_all = False
         self.queued_full = False
+        self.opening_rules = set()
+
+    def opened(self):
+        with self.db.connect() as db:
+            self.opening_rules = {r['id'] for r in rows(db,'SELECT id FROM rules WHERE enabled=1')}
+            evaluate_rules(db,emit,self.opening_rules)
+            tracked = db.execute("SELECT 1 FROM rules WHERE enabled=1 LIMIT 1").fetchone()
+        if tracked:
+            self.sync()
 
     def sync(self, full=False, symbols=None):
         if not self.busy.acquire(blocking=False):
@@ -61,9 +70,9 @@ class Service:
                 with self.db.connect() as db:
                     status(db,'running','1')
                     tracked = symbols if symbols is not None else [r['symbol'] for r in rows(db,"SELECT symbol FROM watchlist UNION SELECT symbol FROM rules WHERE enabled=1 UNION SELECT DISTINCT symbol FROM transactions WHERE symbol<>''")]
-                actions = [('bao_calendar',tracked[0] if tracked else '600036')]
+                actions = [('ak_quote',symbol) for symbol in tracked]
+                actions.append(('bao_calendar',tracked[0] if tracked else '600036'))
                 for symbol in tracked:
-                    actions.append(('ak_quote',symbol))
                     if full:
                         actions.extend((action,symbol) for action in (['ak_etf_history','ak_etf_dividends'] if is_etf(symbol) else ['bao_history','bao_dividends','ak_dividends']))
                 for action,symbol in actions:
@@ -76,7 +85,7 @@ class Service:
                         action, result = 'ak_calendar', fetch('ak_calendar', {'symbol':symbol})
                     with self.db.connect() as db:
                         apply_result(db,action,symbol,result)
-                        evaluate_rules(db,emit)
+                        evaluate_rules(db,emit,self.opening_rules)
                 self.last_quotes = time.monotonic()
                 if full and symbols is None:
                     self.last_full = now().date().isoformat()
@@ -105,7 +114,7 @@ class Service:
                     run_cashflows(db)
                     build_state(db)  # 派息日生成待确认到账，不自动增加现金。
                     tracked = db.execute('SELECT 1 FROM watchlist UNION SELECT 1 FROM rules WHERE enabled=1 UNION SELECT 1 FROM transactions WHERE symbol<>\'\' LIMIT 1').fetchone()
-                    evaluate_rules(db, emit)
+                    evaluate_rules(db, emit, self.opening_rules)
                 if tracked:
                     moment = now()
                     market = moment.weekday() < 5 and ('09:30'<=moment.strftime('%H:%M')<='11:30' or '13:00'<=moment.strftime('%H:%M')<='15:00')
@@ -295,13 +304,12 @@ def create_app(database=None, token=None, background=True):
             confirm_dividend(db,eid,body)
         return {'ok':True}
 
-    @app.post('/api/rules',dependencies=[Depends(auth)])
-    def rule(body:dict):
+    def save_rule(body:dict, rid=None):
         symbol = symbol_code(body.get('symbol',''))
         price, yield_value = body.get('target_price'),body.get('target_yield')
         price = str(decimal(price,True)) if price not in (None,'') else None
         yield_value = str(decimal(yield_value,True)) if yield_value not in (None,'') else None
-        basis,mode = body.get('basis','avg3'),body.get('mode','price')
+        basis,mode = body.get('basis','ttm'),body.get('mode','price')
         if mode not in {'price','yield','all'} or basis not in {'ttm','last_year','avg3','avg5'}:
             raise ValueError('请设置价格或股息率条件，并选择有效口径')
         if (mode in {'price','all'} and price is None) or (mode in {'yield','all'} and yield_value is None):
@@ -312,11 +320,36 @@ def create_app(database=None, token=None, background=True):
             price = None
         with database.connect() as db:
             db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO NOTHING', (symbol,security_name(db,symbol,body.get('name',''))))
-            rid = uid()
-            db.execute('INSERT INTO rules VALUES(?,?,?,?,?,?,1,0)',(rid,symbol,price,yield_value,basis,mode))
-            evaluate_rules(db, emit)
+            before = db.execute('SELECT * FROM rules WHERE id=?',(rid,)).fetchone() if rid else None
+            if rid and not before:
+                raise ValueError('关注条件不存在，请刷新后重试')
+            if rid:
+                db.execute('UPDATE rules SET symbol=?,target_price=?,target_yield=?,basis=?,mode=?,triggered=0 WHERE id=?',(symbol,price,yield_value,basis,mode,rid))
+            else:
+                rid = uid()
+                db.execute('INSERT INTO rules VALUES(?,?,?,?,?,?,1,0)',(rid,symbol,price,yield_value,basis,mode))
+            audit(db,'update' if before else 'create','rule:'+rid,dict(before) if before else None,body)
+            evaluate_rules(db, emit, {rid})
         if background:
             service.sync(True,[symbol])
+        return {'ok':True,'id':rid}
+
+    @app.post('/api/rules',dependencies=[Depends(auth)])
+    def rule(body:dict):
+        return save_rule(body)
+
+    @app.put('/api/rules/{rid}',dependencies=[Depends(auth)])
+    def edit_rule(rid:str,body:dict):
+        return save_rule(body,rid)
+
+    @app.post('/api/rules/order',dependencies=[Depends(auth)])
+    def order_rules(body:dict):
+        ids = body.get('ids')
+        with database.connect() as db:
+            existing = {r['id'] for r in rows(db,'SELECT id FROM rules')}
+            if not isinstance(ids,list) or not all(isinstance(i,str) for i in ids) or len(ids)!=len(existing) or set(ids)!=existing:
+                raise ValueError('关注列表已变化，请刷新后重新排序')
+            set_preference(db,'rule_order',json.dumps(ids))
         return {'ok':True}
 
     @app.delete('/api/rules/{rid}',dependencies=[Depends(auth)])
@@ -356,12 +389,12 @@ def create_app(database=None, token=None, background=True):
     @app.get('/api/export',dependencies=[Depends(auth)])
     def export():
         with database.connect() as db:
-            return {'format':'assetgrove','version':1,'exported_at':now().isoformat(),'tables':{table:rows(db,'SELECT * FROM '+table) for table in BACKUP_TABLES}}
+            return {'format':'assetgrove','version':2,'exported_at':now().isoformat(),'tables':{table:rows(db,'SELECT * FROM '+table) for table in BACKUP_TABLES}}
 
     @app.post('/api/import',dependencies=[Depends(auth)])
     def import_backup(body:dict):
-        if body.get('format')!='assetgrove' or body.get('version')!=1 or set(body.get('tables',{}))!=set(BACKUP_TABLES):
-            raise ValueError('不是受支持的 AssetGrove v1 备份文件')
+        if body.get('format')!='assetgrove' or body.get('version') not in {1,2} or set(body.get('tables',{}))!=set(BACKUP_TABLES):
+            raise ValueError('不是受支持的 AssetGrove 备份文件')
         import sqlite3
         try:
             with database.connect() as db:
@@ -371,6 +404,8 @@ def create_app(database=None, token=None, background=True):
                 for table in BACKUP_TABLES:
                     columns = [r['name'] for r in db.execute('PRAGMA table_info('+table+')')]
                     for record in body['tables'][table]:
+                        if table=='transactions' and body['version']==1 and 'cash_settlement' not in record:
+                            record = {**record,'cash_settlement':0}
                         if set(record)!=set(columns):
                             raise ValueError('备份字段不匹配：'+table)
                         db.execute('INSERT INTO '+table+' VALUES('+','.join('?' for _ in columns)+')',[record[c] for c in columns])
@@ -384,8 +419,9 @@ def create_app(database=None, token=None, background=True):
                 for t in rows(db,'SELECT * FROM transactions'):
                     iso_date(t['date'])
                     decimal(t['price'])
-                    if t['quantity']<0 or t['fees']<0:
+                    if t['quantity']<0 or t['fees']<0 or t['cash_settlement'] not in (0,1) or (t['cash_settlement'] and t['kind'] not in {'buy','sell'}):
                         raise ValueError('备份含无效交易')
+                set_preference(db,'schema_version','3')
                 replay(db,validate=True)
                 build_state(db)
                 audit(db,'restore','backup',before=before,after={'exported_at':body.get('exported_at')})
@@ -409,7 +445,8 @@ def main():
     port = sock.getsockname()[1]
     emit({'event':'connection','port':port,'token':token})
     import uvicorn
-    config = uvicorn.Config(create_app(token=token),log_level='warning')
+    app = create_app(token=token)
+    config = uvicorn.Config(app,log_level='warning')
     server = uvicorn.Server(config)
     if args.desktop:
         def watch_desktop():
@@ -417,6 +454,12 @@ def main():
             for line in sys.stdin:
                 if line.strip() == 'shutdown':
                     break
+                if line.strip() == 'opened':
+                    try:
+                        app.state.service.opened()
+                    except Exception as exc:
+                        with app.state.database.connect() as db:
+                            status(db,'opening_alert_error',str(exc)[:300])
             server.should_exit = True
         threading.Thread(target=watch_desktop,daemon=True).start()
     server.run(sockets=[sock])

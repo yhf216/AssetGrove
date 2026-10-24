@@ -48,7 +48,10 @@ class Database:
                 source.backup(target)
         with self.connect() as db:
             db.executescript(SCHEMA)
-            db.execute("INSERT INTO meta VALUES('schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
+            if 'cash_settlement' not in {r['name'] for r in db.execute('PRAGMA table_info(transactions)')}:
+                # 旧版买卖没有结算现金，升级时保持原账本余额，只有新增交易默认自动结算。
+                db.execute('ALTER TABLE transactions ADD COLUMN cash_settlement INTEGER NOT NULL DEFAULT 0')
+            db.execute("INSERT INTO meta VALUES('schema_version','3') ON CONFLICT(key) DO UPDATE SET value='3'")
             db.execute("INSERT OR IGNORE INTO meta VALUES('tracking_start',?)", (now().date().isoformat(),))
             for catalog in sorted((Path(__file__).parent/'data').glob('*.json')):
                 data = json.loads(catalog.read_text(encoding='utf-8'))

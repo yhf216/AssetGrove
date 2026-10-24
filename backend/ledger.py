@@ -75,7 +75,12 @@ def security_name(db, symbol, provided=''):
 
 def cash_effect(tx):
     kind = tx['kind']
-    if kind in {'buy', 'sell', 'opening_position', 'dividend_record'}:
+    if kind in {'buy', 'sell'}:
+        if not tx.get('cash_settlement', 0):
+            return 0
+        gross = cents(decimal(tx['price']) * tx['quantity'])
+        return -gross - tx['fees'] if kind == 'buy' else gross - tx['fees']
+    if kind in {'opening_position', 'dividend_record'}:
         return 0
     if kind == 'transfer':
         return -tx['amount']
@@ -205,12 +210,13 @@ def save_transaction(db, body, tx_id=None, internal=False):
         created = old['created_at']
     else:
         tx_id, created = uid(), now().isoformat()
+    settlement = (before['cash_settlement'] if before else 1) if kind in {'buy', 'sell'} else 0
     values = (tx_id, kind, aid, to_id, tx_date, symbol, quantity, str(price), fees, amount,
-              str(body.get('note', ''))[:500], body.get('dividend_id') if internal else None, created)
+              str(body.get('note', ''))[:500], body.get('dividend_id') if internal else None, created, settlement)
     if before:
-        db.execute('UPDATE transactions SET kind=?,account_id=?,to_account_id=?,date=?,symbol=?,quantity=?,price=?,fees=?,amount=?,note=?,dividend_id=?,created_at=? WHERE id=?',values[1:]+(tx_id,))
+        db.execute('UPDATE transactions SET kind=?,account_id=?,to_account_id=?,date=?,symbol=?,quantity=?,price=?,fees=?,amount=?,note=?,dividend_id=?,created_at=?,cash_settlement=? WHERE id=?',values[1:]+(tx_id,))
     else:
-        db.execute('INSERT INTO transactions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)', values)
+        db.execute('INSERT INTO transactions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', values)
     replay(db, validate=True)
     reconcile(db, strict=True)
     audit(db, 'update' if before else 'create', 'transaction:' + tx_id, before, body)
@@ -292,7 +298,8 @@ def dps_for(db, symbol, basis='ttm'):
     events = rows(db, "SELECT * FROM dividends WHERE symbol=? AND status='implemented'", (symbol,))
     if basis == 'ttm':
         dates = [e for e in events if e['ex_date'] and (today - timedelta(days=365)).isoformat() < e['ex_date'] <= today.isoformat()]
-        return sum((decimal(e['cash_ps']) for e in dates), Decimal(0)) if events else None
+        covered = db.execute('SELECT 1 FROM sync_status WHERE key=?', ('dividend_coverage:' + symbol,)).fetchone()
+        return sum((decimal(e['cash_ps']) for e in dates), Decimal(0)) if events or covered else None
     years = {'last_year': 1, 'avg3': 3, 'avg5': 5}.get(basis)
     if not years:
         raise ValueError('未知股息口径')
@@ -340,10 +347,11 @@ def build_state(db):
         h['annual_dividend_estimate'] = float(dps * h['quantity']) if dps is not None else None
         missing_dividends += int(dps is None)
         estimate += cents(h['annual_dividend_estimate'] or 0)
-        h['yield_ttm'] = float(dps / decimal(q['price']) * 100) if q and dps is not None else None
-        h['cost_yield_ttm'] = float(dps / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and dps is not None else None
-        h['dividend_yield'] = h['yield_ttm']
-        h['cost_dividend_yield'] = h['cost_yield_ttm']
+        ttm = dps_for(db, h['symbol'], 'ttm')
+        h['yield_ttm'] = float(ttm / decimal(q['price']) * 100) if q and ttm is not None else None
+        h['cost_yield_ttm'] = float(ttm / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and ttm is not None else None
+        h['dividend_yield'] = float(dps / decimal(q['price']) * 100) if q and dps is not None else None
+        h['cost_dividend_yield'] = float(dps / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and dps is not None else None
         h['instrument'] = 'etf' if is_etf(h['symbol']) else 'stock'
     broker_cash = sum(a['balance_cents'] for a in accounts if a['kind'] == 'broker')
     allocation = {k: sum(a['balance_cents'] for a in accounts if a['kind'] == k) for k in KINDS}
@@ -408,11 +416,14 @@ def build_state(db):
     entitlements = rows(db, 'SELECT e.*,d.symbol,d.pay_date,d.cash_ps,a.name account_name FROM entitlements e JOIN dividends d ON d.id=e.dividend_id JOIN accounts a ON a.id=e.account_id ORDER BY d.pay_date')
     for e in entitlements:
         e['expected_amount'] = money(e['expected_amount'])
+    rules = rows(db, 'SELECT * FROM rules ORDER BY rowid')
+    rule_order = {rid: i for i, rid in enumerate(json.loads(preference(db, 'rule_order', '[]')))}
+    rules.sort(key=lambda r: rule_order.get(r['id'], len(rule_order)))
     return {'today': now().date().isoformat(), 'tracking_start': tracking_start, 'timeline_start':start, 'accounts': accounts, 'holdings': holdings,
             'preferences': {'account_sort': sort_mode, 'dividend_basis': dividend_basis},
             'securities':rows(db,'SELECT * FROM securities ORDER BY name'),
             'transactions': txs, 'watchlist': watch, 'dividends': rows(db, 'SELECT * FROM dividends ORDER BY pay_date DESC,ex_date DESC'),
-            'entitlements': entitlements, 'rules': rows(db, 'SELECT * FROM rules'), 'cashflows': rows(db, 'SELECT * FROM cashflows'),
+            'entitlements': entitlements, 'rules': rules, 'cashflows': rows(db, 'SELECT * FROM cashflows'),
             'notifications': rows(db, 'SELECT * FROM notifications ORDER BY date DESC LIMIT 100'),
             'sync': {r['key']: r['value'] for r in rows(db, 'SELECT * FROM sync_status')},
             'summary': {'total': money(total), 'stock_value': money(stock_value), 'broker_value': money(broker_cash+stock_value),

@@ -50,13 +50,19 @@ def _worker(pipe, action, payload):
                 else:
                     result = _fetch(action, payload)
             except Exception as primary_error:
-                if action != 'ak_quote':
+                fallbacks = {'ak_quote':['ak_quote_sina','ak_quote_xq'], 'ak_etf_history':['ak_etf_history_sina'], 'ak_etf_dividends':['ak_etf_dividends_sina']}.get(action)
+                if not fallbacks:
                     raise
-                try:
-                    result = _fetch('ak_quote_xq',payload)
-                except Exception as fallback_error:
-                    raise RuntimeError(f'东方财富：{str(primary_error)[:110]}；雪球备用：{str(fallback_error)[:110]}') from fallback_error
-                result['primary_error'] = str(primary_error)[:160]
+                errors = [f'主源：{str(primary_error)[:100]}']
+                for fallback in fallbacks:
+                    try:
+                        result = _fetch(fallback,payload)
+                        break
+                    except Exception as exc:
+                        errors.append(f'{fallback}：{str(exc)[:100]}')
+                else:
+                    raise RuntimeError('；'.join(errors)) from primary_error
+                pipe.send({'progress':'备用源查询成功'})
         pipe.send({'ok': True, 'data': result})
     except BaseException as exc:
         pipe.send({'ok': False, 'error': f'{type(exc).__name__}: {str(exc)[:240]}'})
@@ -184,11 +190,51 @@ def _fetch(action, payload):
         return ak.tool_trade_date_hist_sina().astype(str).to_dict('records')
     if action == 'ak_etf_history':
         frame = ak.fund_etf_hist_em(symbol=symbol, start_date=(now().date()-timedelta(days=365)).strftime('%Y%m%d'), end_date=now().strftime('%Y%m%d'), adjust='')
+        if frame.empty:
+            raise ValueError('东方财富 ETF 历史行情为空')
         return frame.astype(object).where(frame.notna(),None).to_dict('records')
+    if action == 'ak_etf_history_sina':
+        frame = ak.fund_etf_hist_sina(symbol=market_prefix(symbol)+symbol)
+        cutoff = (now().date()-timedelta(days=365)).isoformat()
+        return [{'日期':clean_date(r['date']),'收盘':str(r['close']),'_source':'AKShare / 新浪财经 ETF'} for r in frame.to_dict('records') if clean_date(r['date']) >= cutoff]
     if action == 'ak_etf_dividends':
         frame = ak.fund_open_fund_info_em(symbol=symbol,indicator='分红送配详情')
-        splits = ak.fund_open_fund_info_em(symbol=symbol,indicator='拆分详情')
-        return {'events':frame.astype(object).where(frame.notna(),None).to_dict('records'), 'has_splits':not splits.empty}
+        try:
+            splits = ak.fund_open_fund_info_em(symbol=symbol,indicator='拆分详情')
+            has_splits = not splits.empty
+        except Exception:
+            has_splits = True  # 折算资料缺失时保留已查到的现金分红，暂停多年预测。
+        return {'events':frame.astype(object).where(frame.notna(),None).to_dict('records'), 'has_splits':has_splits}
+    if action == 'ak_etf_dividends_sina':
+        import requests
+        from akshare.utils import demjson
+        text = requests.get(f'https://finance.sina.com.cn/realstock/company/{market_prefix(symbol)+symbol}/hfq.js',timeout=12).text
+        if not text.lstrip().startswith('var ') or '=' not in text:
+            raise ValueError('新浪未返回有效的 ETF 分红数据')
+        raw = demjson.decode(text.split('=',1)[1].strip().rstrip(';'))
+        if not isinstance(raw,dict) or not isinstance(raw.get('data'),list) or not raw['data']:
+            raise ValueError('新浪 ETF 分红覆盖范围无法确认')
+        cumulative, events = Decimal(0), []
+        for r in sorted(raw['data'],key=lambda r:str(r['d'] if isinstance(r,dict) and 'd' in r else r.get('date','') if isinstance(r,dict) else r[0])):
+            day = clean_date(r.get('date',r.get('d')) if isinstance(r,dict) else r[0])
+            value = decimal(r.get('u') if isinstance(r,dict) else r[3])
+            if value < cumulative:
+                raise ValueError('ETF 累计分红下降，无法安全换算单次派息')
+            delta, cumulative = value-cumulative, value
+            if day and day!='1900-01-01' and delta>0:
+                events.append({'除息日':day,'每份分红':str(delta)+'元'})
+        return {'events':events,'has_splits':True,'source':'新浪财经 ETF / 累计分红差额'}
+    if action == 'ak_quote_sina':
+        import requests
+        response = requests.get('https://hq.sinajs.cn/list='+market_prefix(symbol)+symbol,headers={'Referer':'https://finance.sina.com.cn/'},timeout=12)
+        response.encoding = 'gb18030'
+        values = response.text.split('="',1)[-1].split('"',1)[0].split(',')
+        if len(values)<32:
+            raise ValueError('新浪未返回有效报价')
+        price = decimal(values[3],positive=True)
+        stamp = datetime.fromisoformat(values[30]+'T'+values[31]).replace(tzinfo=TZ)
+        return {'symbol':symbol,'name':values[0],'price':str(price),'as_of':stamp.isoformat(),
+                'timestamp_verified':stamp<=now()+timedelta(minutes=1),'source':'新浪财经'}
     if action == 'ak_quote_xq':
         frame = ak.stock_individual_spot_xq(symbol=market_prefix(symbol).upper()+symbol,timeout=12)
         values = dict(zip(frame['item'],frame['value']))
@@ -238,6 +284,7 @@ def apply_result(db,action,symbol,result):
     elif action in {'bao_history', 'ak_etf_history'}:
         source = 'BaoStock' if action == 'bao_history' else 'AKShare / 东方财富 ETF'
         if action == 'ak_etf_history':
+            source = data[0].get('_source',source) if data else source
             data = [{'date':clean_date(r.get('日期')), 'close':str(r['收盘'])} for r in data if r.get('收盘') is not None]
         for r in data:
             if r.get('close'):
@@ -250,8 +297,13 @@ def apply_result(db,action,symbol,result):
             status(db,'trading_day:'+r['calendar_date'],r['is_trading_day'])
     elif action == 'ak_calendar':
         days = {clean_date(r.get('trade_date')) for r in data}
-        if now().date().isoformat() in days:
-            status(db,'trading_day:'+now().date().isoformat(),'1')
+        days.discard('')
+        if days:
+            end = min(now().date().isoformat(),max(days))
+            for offset in range(46):
+                day = (now().date()-timedelta(days=offset)).isoformat()
+                if day <= end:
+                    status(db,'trading_day:'+day,'1' if day in days else '0')
     elif action == 'ak_etf_dividends':
         for r in data['events']:
             ex = clean_date(r.get('除息日'))
@@ -262,7 +314,7 @@ def apply_result(db,action,symbol,result):
             cash = decimal(numbers[-1],positive=True) / (10 if '每10份分红' in r else 1)
             save_dividend(db,{'symbol':symbol,'report_year':int(ex[:4]),'record_date':clean_date(r.get('权益登记日')),
                              'ex_date':ex,'pay_date':clean_date(r.get('分红发放日')),'cash_ps':str(cash),
-                             'status':'implemented','source':'AKShare / 天天基金 ETF'})
+                             'status':'implemented','source':data.get('source','AKShare / 天天基金 ETF')})
         # 该接口返回成立以来全部分红。ETF 以除息年度汇总，不冒充上市公司财年分红。
         status(db,'dividend_coverage:'+symbol,1990)
         if data['has_splits']:
@@ -299,18 +351,47 @@ def apply_result(db,action,symbol,result):
         if corporate_actions:
             status(db,'corporate_actions:'+symbol,'历史存在送转股；多年每股股息尚未统一股本基准，均值暂不可用')
 
-def evaluate_rules(db, emit=lambda value: None):
-    moment = now()
-    trading = db.execute('SELECT value FROM sync_status WHERE key=?',('trading_day:'+moment.date().isoformat(),)).fetchone()
+def usable_rule_quote(db, quote, moment, opening=False):
+    if not quote or not quote['timestamp_verified'] or not quote['as_of']:
+        return False
+    try:
+        stamp = datetime.fromisoformat(quote['as_of'])
+        age = (moment - stamp).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    if age < 0:
+        return False
+    day = moment.date().isoformat()
+    trading = db.execute('SELECT value FROM sync_status WHERE key=?', ('trading_day:' + day,)).fetchone()
     hm = moment.strftime('%H:%M')
-    if not trading or trading[0] != '1' or not ('09:30' <= hm <= '11:30' or '13:00' <= hm <= '15:00'):
-        return
+    intraday = trading and trading[0] == '1' and ('09:30' <= hm <= '11:30' or '13:00' <= hm <= '15:00')
+    if intraday:
+        return age <= 900
+    if not opening:
+        return False
+    if not trading:
+        if moment.weekday() < 5:
+            return False
+        coverage = db.execute("SELECT MAX(substr(key,13)) FROM sync_status WHERE key LIKE 'trading_day:%' AND substr(key,13)<=?",(day,)).fetchone()[0]
+        friday = (moment.date()-timedelta(days=moment.weekday()-4)).isoformat()
+        if not coverage or coverage < friday:
+            return False
+    # 午休只接受当天上午的收盘报价；开盘前/休市时只接受最近完整交易日的收盘报价。
+    if trading and trading[0] == '1' and '11:30' < hm < '13:00':
+        return stamp.date() == moment.date() and stamp.strftime('%H:%M') >= '11:15'
+    if moment.weekday() < 5 and '09:30' <= hm < '15:00' and not trading:
+        return False
+    cutoff = day if hm > '15:00' or (trading and trading[0] == '0') or moment.weekday() >= 5 else (moment.date()-timedelta(days=1)).isoformat()
+    latest = db.execute("SELECT substr(key,13) day FROM sync_status WHERE key LIKE 'trading_day:%' AND value='1' AND substr(key,13)<=? ORDER BY key DESC LIMIT 1", (cutoff,)).fetchone()
+    return bool(latest and stamp.date().isoformat() == latest[0] and stamp.strftime('%H:%M') >= '14:45' and age <= 40*86400)
+
+
+def evaluate_rules(db, emit=lambda value: None, opening_ids=None):
+    moment = now()
     for r in rows(db,'SELECT * FROM rules WHERE enabled=1'):
+        opening = opening_ids is not None and r['id'] in opening_ids
         q = db.execute('SELECT * FROM quotes WHERE symbol=?',(r['symbol'],)).fetchone()
-        if not q or not q['timestamp_verified'] or not q['as_of']:
-            continue
-        age = (moment - datetime.fromisoformat(q['as_of'])).total_seconds()
-        if not 0 <= age <= 900:
+        if not usable_rule_quote(db,q,moment,opening):
             continue
         checks = []
         if r['target_price'] is not None and r['mode'] != 'yield':
@@ -321,11 +402,13 @@ def evaluate_rules(db, emit=lambda value: None):
                 continue
             checks.append(dps/decimal(q['price'])*100 >= decimal(r['target_yield']))
         hit = bool(checks) and (all(checks) if r['mode']=='all' else any(checks))
-        if hit and not r['triggered']:
+        if hit and (opening or not r['triggered']):
             label = {'ttm':'近12个月','last_year':'1年','avg3':'3年平均','avg5':'5年平均'}.get(r['basis'],r['basis'])
             dps = dps_for(db,r['symbol'],r['basis'])
             yield_text = f" · {label}股息率 {dps/decimal(q['price'])*100:.2f}%" if dps is not None else ''
-            message = {'event':'notification','title':security_name(db,r['symbol'])+' 达到关注条件','body':f"{r['symbol']} · 最新价 ¥{q['price']}{yield_text}"}
+            message = {'event':'notification','title':security_name(db,r['symbol'])+' 达到关注条件','body':f"{r['symbol']} · 参考价 ¥{q['price']}{yield_text}\n报价 {q['as_of'][:19].replace('T',' ')}"}
             db.execute('INSERT INTO notifications VALUES(?,?,?,?,?,0)',(uid(),moment.isoformat(),message['title'],message['body'],r['id']))
             emit(message)
         db.execute('UPDATE rules SET triggered=? WHERE id=?',(int(hit),r['id']))
+        if opening:
+            opening_ids.discard(r['id'])
