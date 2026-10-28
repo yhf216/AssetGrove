@@ -374,7 +374,7 @@ def build_state(db):
     txs = rows(db, 'SELECT * FROM transactions ORDER BY date DESC,created_at DESC,rowid DESC')
     year = now().year
     dividend_txs = [t for t in txs if t['kind'] in DIVIDEND_KINDS]
-    from .dividend_history import dividend_receipts
+    from .dividend_history import dividend_receipts, missing_receipt_dates
     receipts = dividend_receipts(db, txs)
     confirmed_received = sum(t['amount'] for t in dividend_txs if t['date'].startswith(str(year)))
     received = sum(cents(t['amount']) for t in receipts if t['date'].startswith(str(year)))
@@ -434,6 +434,7 @@ def build_state(db):
             'summary': {'total': money(total), 'stock_value': money(stock_value), 'broker_value': money(broker_cash+stock_value),
                         'broker_cash': money(broker_cash), 'received': money(received), 'annual_estimate': money(estimate),
                         'confirmed_received':money(confirmed_received), 'inferred_received':money(inferred_received),
+                        'receipt_missing_dates':missing_receipt_dates(db),
                         'estimated_positions': estimated_count, 'missing_dividend_positions': missing_dividends,
                         'allocation': {k: money(v) for k,v in allocation.items()}},
             'timeline': timeline, 'monthly_dividends': monthly, 'dividend_years':dividend_years, 'monthly_dividends_by_year':by_year}

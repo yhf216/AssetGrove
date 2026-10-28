@@ -1,0 +1,68 @@
+<script setup lang="ts">
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import * as echarts from 'echarts/core'
+import { CandlestickChart, LineChart, BarChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, MarkLineComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+import { fontSize, resolvedTheme } from '../appearance'
+
+echarts.use([CandlestickChart,LineChart,BarChart,GridComponent,TooltipComponent,LegendComponent,DataZoomComponent,MarkLineComponent,CanvasRenderer])
+const props=defineProps<{ history:any; catalog:any[] }>()
+const host=ref<HTMLElement>(), range=ref('')
+let chart:echarts.ECharts|undefined,observer:ResizeObserver,zoom:any=null,lastKey=''
+const key=computed(()=>JSON.stringify([props.history?.preferences?.symbols,props.history?.preferences?.period,props.history?.preferences?.normalize]))
+function update(){
+  if(!chart || !props.history)return
+  const prefs=props.history.preferences, all=props.history.series || {},symbols:string[]=prefs.symbols
+  const primary=symbols[0], normalized=symbols.length>1 && prefs.normalize
+  const available=symbols.map(s=>all[s]?.[0]?.date).filter(Boolean)
+  const common=available.length===symbols.length ? available.sort().at(-1) : null
+  const dates:string[]=Array.from(new Set<string>([...symbols.flatMap(s=>(all[s] || []).map((b:any)=>b.date)),...(prefs.trin_enabled?(props.history.trin || []).map((r:any)=>r.date):[])])).sort().filter(day=>!normalized || !common || day>=common)
+  const dark=resolvedTheme.value==='dark',ink=dark?'#b9cabe':'#68766d',border=dark?'#39483e':'#e4eae3'
+  const colors=dark?['#93c6a3','#8db6c5','#c4a8dc','#d68e8e','#8ec2bf']:['#36775d','#377d9d','#8862ad','#b36363','#36857f']
+  const series:any[]=[],bySymbol:Record<string,Map<string,any>>={}
+  for(const [index,symbol] of symbols.entries()){
+    const bars=all[symbol] || [],byDate=new Map<string,any>(bars.map((b:any)=>[b.date,b]));bySymbol[symbol]=byDate
+    const first=bars.find((b:any)=>!common || b.date>=common)?.close
+    const value=(v:any)=>v==null?null:normalized && first ? v/first*100 : v
+    const name=props.catalog.find(c=>c.symbol===symbol)?.name || symbol
+    const candle=symbols.length===1 && prefs.chart_type==='candlestick'
+    series.push({name,type:candle?'candlestick':'line',xAxisIndex:0,yAxisIndex:0,
+      data:dates.map(day=>{const b=byDate.get(day);return candle?(b?[b.open,b.close,b.low,b.high]:['-','-','-','-']):b?value(b.close):null}),
+      showSymbol:dates.length<10,symbolSize:5,connectNulls:false,large:candle,progressive:1000,
+      ...(candle?{itemStyle:{color:'#d96666',color0:'#4c9d7b',borderColor:'#d96666',borderColor0:'#4c9d7b'}}:{lineStyle:{width:1.5},color:colors[index%colors.length]})})
+    if(prefs.ma_enabled && symbol===primary){
+      for(const [i,n] of prefs.ma_periods.entries())series.push({name:`M${n}（日）`,type:'line',showSymbol:false,connectNulls:false,lineStyle:{width:1,type:'dashed',color:['#8a9385','#a58ab8','#6f9ba8','#ba9292'][i%4]},itemStyle:{color:['#8a9385','#a58ab8','#6f9ba8','#ba9292'][i%4]},xAxisIndex:0,yAxisIndex:0,data:dates.map(day=>value(byDate.get(day)?.ma?.[String(n)]))})
+    }
+  }
+  const trin=new Map<string,any>((props.history.trin || []).map((r:any)=>[r.date,r]))
+  if(prefs.trin_enabled)series.push({name:prefs.period==='d'?'TRIN':'TRIN（日值均值）',type:'line',xAxisIndex:0,yAxisIndex:1,connectNulls:false,showSymbol:true,symbolSize:dates.length<20?6:2,lineStyle:{width:1.4,color:'#bd9147'},itemStyle:{color:'#bd9147'},data:dates.map(day=>trin.get(day)?.value ?? null),markLine:{silent:true,symbol:'none',label:{formatter:'TRIN = 1'},lineStyle:{color:'#bd9147',type:'dashed'},data:[{yAxis:1}]}})
+  if(prefs.volume_enabled)series.push({name:'主指数成交量',type:'bar',xAxisIndex:1,yAxisIndex:2,progressive:1000,barMaxWidth:8,data:dates.map(day=>{const b=bySymbol[primary]?.get(day);return b?{value:b.volume,itemStyle:{color:b.close>=b.open?'#d96666':'#4c9d7b'}}:null})})
+  if(lastKey!==key.value){zoom=null;lastKey=key.value}
+  const axes=[0,...(prefs.volume_enabled?[1]:[])]
+  chart.setOption({animation:false,color:colors,backgroundColor:'transparent',textStyle:{fontSize:fontSize.value*.8,color:ink},
+    legend:{type:'scroll',top:5,left:12,right:12,textStyle:{color:ink,fontSize:fontSize.value*.8}},
+    tooltip:{trigger:'axis',confine:true,axisPointer:{type:'cross'},backgroundColor:dark?'#202b25':'#fff',borderColor:border,textStyle:{color:ink,fontSize:fontSize.value*.8}},
+    axisPointer:{link:[{xAxisIndex:'all'}]},
+    grid:[{left:Math.max(64,fontSize.value*3.5),right:Math.max(58,fontSize.value*3),top:62,height:prefs.volume_enabled?'57%':'76%'},...(prefs.volume_enabled?[{left:Math.max(64,fontSize.value*3.5),right:Math.max(58,fontSize.value*3),top:'76%',height:'12%'}]:[])],
+    xAxis:axes.map(index=>({type:'category',gridIndex:index,data:dates,boundaryGap:true,axisLabel:{show:index===axes.at(-1),color:ink,fontSize:fontSize.value*.75,hideOverlap:true},axisLine:{lineStyle:{color:border}},axisTick:{show:false}})),
+    yAxis:[{type:'value',gridIndex:0,scale:true,name:normalized?'基准 100':'指数点位',nameTextStyle:{color:ink},axisLabel:{color:ink},splitLine:{lineStyle:{color:border,type:'dashed'}}},
+      {type:'value',gridIndex:0,scale:true,position:'right',show:prefs.trin_enabled,name:'TRIN',nameTextStyle:{color:'#bd9147'},axisLabel:{color:'#bd9147'},splitLine:{show:false}},
+      ...(prefs.volume_enabled?[{type:'value',gridIndex:1,scale:true,splitNumber:2,name:'成交量（股）',nameTextStyle:{color:ink},axisLabel:{color:ink,formatter:(v:number)=>Math.abs(v)>=1e8?(v/1e8).toFixed(1)+'亿':Math.round(v/1e4)+'万'},splitLine:{show:false}}]:[])],
+    dataZoom:[{type:'inside',xAxisIndex:axes,filterMode:'filter',zoomOnMouseWheel:'ctrl',moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || {start:Math.max(0,(dates.length-500)/Math.max(1,dates.length)*100),end:100})},
+      {type:'slider',xAxisIndex:axes,filterMode:'filter',bottom:9,height:22,borderColor:border,textStyle:{color:ink},...(zoom || {start:Math.max(0,(dates.length-500)/Math.max(1,dates.length)*100),end:100})}],series},true)
+  updateRange()
+}
+function updateRange(){
+  const options=chart?.getOption() as any,dates=options?.xAxis?.[0]?.data || [],z=options?.dataZoom?.[0]
+  if(!dates.length){range.value='暂无历史数据';return}
+  const first=Math.max(0,Math.floor((z?.start || 0)/100*(dates.length-1))),last=Math.min(dates.length-1,Math.ceil((z?.end ?? 100)/100*(dates.length-1)))
+  range.value=`显示区间 ${dates[first]} — ${dates[last]}`
+}
+function reset(){zoom=null;update()}
+function handleWheel(event:WheelEvent){if(!event.ctrlKey)event.stopPropagation()}
+onMounted(()=>{chart=echarts.init(host.value);chart.on('datazoom',()=>{const value=(chart!.getOption() as any).dataZoom?.[0];if(value)zoom={start:value.start,end:value.end};updateRange()});observer=new ResizeObserver(()=>chart?.resize());observer.observe(host.value!);update()})
+watch([()=>props.history,fontSize,resolvedTheme],update,{deep:false})
+onBeforeUnmount(()=>{observer?.disconnect();chart?.dispose()})
+</script>
+<template><div class="market-chart-wrap"><div class="market-chart-meta"><span>{{ range }}</span><button class="text-button" @click="reset">重置视图</button></div><div ref="host" class="market-chart" role="img" aria-label="市场图表，可拖动平移，按住 Ctrl 滚轮缩放" @wheel.capture.passive="handleWheel" /></div></template>

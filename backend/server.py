@@ -80,11 +80,11 @@ class Service:
                 for action,symbol in actions:
                     if self.stop.is_set():
                         break
-                    result = fetch(action,{'symbol':symbol})
+                    result = fetch(action,{'symbol':symbol},cancel=self.stop)
                     if action == 'bao_calendar' and not result['ok']:
                         with self.db.connect() as db:
                             apply_result(db,action,symbol,result)
-                        action, result = 'ak_calendar', fetch('ak_calendar', {'symbol':symbol})
+                        action, result = 'ak_calendar', fetch('ak_calendar', {'symbol':symbol},cancel=self.stop)
                     with self.db.connect() as db:
                         apply_result(db,action,symbol,result)
                         evaluate_rules(db,emit,self.opening_rules)

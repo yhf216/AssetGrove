@@ -18,6 +18,10 @@
     Delete "$INSTDIR\data\assetgrove.sqlite3-journal"
     Delete "$INSTDIR\data\assetgrove.sqlite3-wal"
     Delete "$INSTDIR\data\assetgrove.sqlite3-shm"
+    Delete "$INSTDIR\data\market.sqlite3"
+    Delete "$INSTDIR\data\market.sqlite3-journal"
+    Delete "$INSTDIR\data\market.sqlite3-wal"
+    Delete "$INSTDIR\data\market.sqlite3-shm"
     Delete "$INSTDIR\settings.json"
     RMDir "$INSTDIR\data"
     IfFileExists "$INSTDIR\data\assetgrove.sqlite3" 0 +2

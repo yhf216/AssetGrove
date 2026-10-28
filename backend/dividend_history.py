@@ -41,3 +41,16 @@ def dividend_receipts(db, transactions):
         if key not in matched:
             result.extend(values)
     return sorted(result,key=lambda t:(t['date'],t['id']),reverse=True)
+
+
+def missing_receipt_dates(db):
+    year=now().year
+    missing=0
+    for event in rows(db,"SELECT * FROM dividends WHERE status='implemented' AND (record_date='' OR pay_date='')"):
+        if not (event['ex_date'].startswith(str(year)) or (not event['ex_date'] and event['report_year']==year-1)):
+            continue
+        if event['record_date']:
+            if any(h['symbol']==event['symbol'] for h in replay(db,event['record_date'])[1]):missing+=1
+        elif db.execute("SELECT 1 FROM transactions WHERE symbol=? AND kind IN ('buy','opening_position') LIMIT 1",(event['symbol'],)).fetchone():
+            missing+=1
+    return missing

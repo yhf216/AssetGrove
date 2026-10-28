@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,
 CREATE TABLE IF NOT EXISTS index_info(symbol TEXT PRIMARY KEY,source TEXT,first_date TEXT,last_date TEXT,updated_at TEXT);
 CREATE TABLE IF NOT EXISTS universe(symbol TEXT PRIMARY KEY,name TEXT,ipo TEXT,out_date TEXT);
 CREATE TABLE IF NOT EXISTS breadth(symbol TEXT,date TEXT,change REAL,volume REAL,trading INTEGER,PRIMARY KEY(symbol,date));
+CREATE INDEX IF NOT EXISTS breadth_date ON breadth(date);
 CREATE TABLE IF NOT EXISTS fetch_ranges(symbol TEXT,start TEXT,end TEXT,PRIMARY KEY(symbol,start,end));
 CREATE TABLE IF NOT EXISTS calendar(date TEXT PRIMARY KEY,trading INTEGER);
 CREATE TABLE IF NOT EXISTS trin(date TEXT PRIMARY KEY,value REAL,advances INTEGER,declines INTEGER,up_volume REAL,down_volume REAL,coverage REAL,source TEXT,provisional INTEGER,reason TEXT);
@@ -154,18 +155,23 @@ class MarketStore:
                 trin=result
             return {'preferences':prefs,'series':series,'trin':trin,'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol')}
 
-    def reconstruct(self,start,end):
+    def reconstruct(self,start,end,cancel=None,progress=None):
         with self.connect() as db:
             universe=rows(db,'SELECT * FROM universe')
             if len(universe)<3000:raise ValueError('历史证券目录不完整，未生成 TRIN')
             days=[r['date'] for r in rows(db,'SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(start,end))]
-            for day in days:
+        for day in days:
+            if cancel is not None and cancel.is_set():return
+            if progress:progress(day)
+            with self.connect() as db:
                 expected={s['symbol'] for s in universe if s['ipo']<=day and (not s['out_date'] or s['out_date']>=day)}
                 observed=[r for r in rows(db,'SELECT symbol,change,volume,trading FROM breadth WHERE date=?',(day,)) if r['symbol'] in expected]
                 actual={r['symbol'] for r in observed}
                 coverage=len(actual & expected)/len(expected) if expected else 0
                 values=trin_value(observed)
                 valid=expected and expected<=actual and values['value'] is not None
+                if not valid and db.execute('SELECT 1 FROM trin WHERE date=? AND value IS NOT NULL',(day,)).fetchone():
+                    continue  # 未完成的回补不能覆盖已经核实的市场快照。
                 db.execute('INSERT OR REPLACE INTO trin VALUES(?,?,?,?,?,?,?,?,?,?)',(day,values['value'] if valid else None,values['advances'],values['declines'],values['up_volume'],values['down_volume'],coverage,'历史全市场 / BaoStock、AKShare',0,'' if valid else '历史样本未齐，未发布数值'))
 
 
@@ -203,7 +209,8 @@ class MarketService:
                 if kind=='history':self.backfill(start,end)
                 else:self.sync_indices()
             except Exception as exc:
-                with self.lock:self.progress['errors'].append(str(exc)[:350])
+                if not self.cancel.is_set():
+                    with self.lock:self.progress['errors'].append(str(exc)[:350])
             finally:
                 self.update(running=False,phase='已停止' if self.cancel.is_set() else '同步结束')
                 self.changed()
@@ -285,4 +292,4 @@ class MarketService:
             if data['errors']:
                 with self.lock:self.progress['errors'].extend(r['symbol']+'：'+r['error'] for r in data['errors'])
         self.update(phase='汇总历史 TRIN')
-        self.store.reconstruct(start,end);self.changed()
+        self.store.reconstruct(start,end,cancel=self.cancel,progress=lambda day:self.update(phase='汇总历史 TRIN '+day));self.changed()

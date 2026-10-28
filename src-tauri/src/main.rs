@@ -12,6 +12,7 @@ struct Backend {
     child: Mutex<Option<CommandChild>>,
     notification_status: Mutex<Option<serde_json::Value>>,
     opening_pending: Mutex<bool>,
+    backend_exited: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -157,6 +158,9 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 let mut pending = Vec::new();
                 while let Some(event) = receiver.recv().await {
+                    if let CommandEvent::Terminated(_) = &event {
+                        *handle.state::<Backend>().backend_exited.lock().unwrap() = true;
+                    }
                     if let CommandEvent::Stdout(bytes) = event {
                         pending.extend_from_slice(&bytes);
                         while let Some(end) = pending.iter().position(|&b|b == b'\n') {
@@ -204,8 +208,11 @@ fn main() {
         if let tauri::RunEvent::Exit = event {
             if let Some(mut child) = handle.state::<Backend>().child.lock().unwrap().take() {
                 let _ = child.write(b"shutdown\n");
-                std::thread::sleep(std::time::Duration::from_millis(350));
-                let _ = child.kill();
+                for _ in 0..60 {
+                    if *handle.state::<Backend>().backend_exited.lock().unwrap() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !*handle.state::<Backend>().backend_exited.lock().unwrap() { let _ = child.kill(); }
             }
         }
     });

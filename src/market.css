@@ -1,0 +1,25 @@
+.market-view { display:flex; flex-direction:column; gap:1rem; padding-bottom:1.5rem; }
+.market-top,.market-periods { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:.6rem; }
+.market-top>.actions { flex-wrap:wrap; }
+.market-controls { padding:1rem 1.2rem; }
+.market-index-list { display:flex; flex-wrap:wrap; gap:.6rem 1rem; padding:0 0 1rem; border:0; margin:0; }
+.market-index-list legend { font-size:1rem; margin-bottom:.6rem; font-weight:600; }
+.market-index-list label,.market-options label { display:flex; align-items:center; gap:.5rem; font-size:.875rem; color:var(--text); }
+.market-index-list input,.market-options input[type=checkbox] { width:1rem; height:1rem; margin:0; flex-shrink:0; }
+.market-options { display:flex; gap:.8rem 1.3rem; flex-wrap:wrap; align-items:center; border-top:1px solid var(--border); padding-top:1rem; }
+.market-options input:not([type=checkbox]) { width:12rem; max-width:100%; }
+.market-options select { padding:.3rem .5rem; }
+.market-plot { min-width:0; padding:.8rem; }
+.market-chart-meta { display:flex; justify-content:space-between; align-items:center; gap:.5rem; flex-wrap:wrap; color:var(--muted); font-size:.85rem; padding:0 .4rem; }
+.market-chart { width:100%; height:clamp(34rem,67vh,49rem); min-width:0; }
+.market-progress { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; color:var(--accent-text); font-size:.9rem; }
+.market-progress progress { width:10rem; accent-color:var(--accent); }
+.market-error { color:var(--warning-text); background:var(--warning-bg); padding:.7rem 1rem; border-radius:8px; font-size:.9rem; overflow-wrap:anywhere; }
+.market-data-row { display:flex; flex-wrap:wrap; gap:.3rem 1.2rem; color:var(--muted); font-size:.8rem; }
+.market-trin-info { display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap; padding:1rem 1.2rem; }
+.market-trin-info>div { display:flex; flex-direction:column; gap:.3rem; }
+.market-trin-info span { color:var(--muted); font-size:.875rem; }
+.market-backfill { padding:1rem 1.2rem; }
+.market-backfill label { display:flex; flex-direction:column; gap:.4rem; }
+.market-backfill p { color:var(--muted); font-size:.875rem; margin:1rem 0; }
+@media(max-width:950px) { .market-controls,.market-plot { padding:.75rem; } .market-top { align-items:flex-start; } .market-backfill .form-row { grid-template-columns:1fr; } }
