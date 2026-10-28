@@ -10,6 +10,7 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import date
 
@@ -23,7 +24,8 @@ from .ledger import (build_state, cents, confirm_dividend, decimal, delete_accou
 from .providers import apply_result, evaluate_rules, fetch, status
 from .storage import Database, audit, now, rows
 from .network import configure_direct_network
-from .settings import read_settings, write_settings
+from .settings import read_settings, write_settings, app_directory
+from .market import MarketStore, MarketService
 
 BACKUP_TABLES = ['meta','accounts','securities','transactions','watchlist','quotes','daily_prices','dividends','entitlements','rules','notifications','cashflows','flow_runs']
 
@@ -127,9 +129,12 @@ class Service:
                     status(db,'scheduler_error',str(exc)[:300])
 
 def create_app(database=None, token=None, background=True):
+    injected_database = database is not None
     database = database or Database()
     token = token or secrets.token_urlsafe(32)
     service = Service(database)
+    market_base = database.path.parent if injected_database else Path(os.getenv('ASSETGROVE_DATA_DIR') or app_directory()/'data')
+    market = MarketService(MarketStore(market_base/'market.sqlite3'))
 
     @asynccontextmanager
     async def lifespan(app):
@@ -137,9 +142,11 @@ def create_app(database=None, token=None, background=True):
             threading.Thread(target=service.loop,daemon=True).start()
         yield
         service.stop.set()
+        market.shutdown()
 
     app = FastAPI(title='AssetGrove Local API',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
     app.state.database, app.state.service = database,service
+    app.state.market = market
     app.add_middleware(CORSMiddleware,allow_origins=['http://127.0.0.1:1420','http://localhost:1420','http://tauri.localhost','https://tauri.localhost','tauri://localhost'],allow_methods=['GET','POST','PUT','DELETE'],allow_headers=['Authorization','Content-Type'])
 
     @app.middleware('http')
@@ -151,6 +158,33 @@ def create_app(database=None, token=None, background=True):
     def auth(authorization: str = Header(default='')):
         if not secrets.compare_digest(authorization,'Bearer '+token):
             raise HTTPException(401,'本地连接令牌无效')
+
+    @app.get('/api/market/state',dependencies=[Depends(auth)])
+    def market_state():
+        return market.state()
+
+    @app.get('/api/market/history',dependencies=[Depends(auth)])
+    def market_history():
+        return market.store.history()
+
+    @app.post('/api/market/preferences',dependencies=[Depends(auth)])
+    def market_preferences(body:dict):
+        return market.store.preferences(body)
+
+    @app.post('/api/market/sync',dependencies=[Depends(auth)])
+    def market_sync(body:dict):
+        kind=body.get('kind','indices')
+        if kind not in {'indices','history'}:raise ValueError('无效同步任务')
+        if kind=='history':
+            start=iso_date(body.get('start'));end=iso_date(body.get('end'))
+            if start>end:raise ValueError('开始日期不能晚于结束日期')
+        else:start=end=None
+        return {'started':market.start(kind,start,end)}
+
+    @app.post('/api/market/cancel',dependencies=[Depends(auth)])
+    def market_cancel():
+        market.cancel.set()
+        return {'ok':True}
 
     @app.exception_handler(ValueError)
     async def invalid(request,exc):

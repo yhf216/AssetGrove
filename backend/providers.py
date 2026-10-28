@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
+import os
 import re
 import socket
 import subprocess
@@ -69,9 +70,9 @@ def _worker(pipe, action, payload):
     finally:
         pipe.close()
 
-def fetch(action, payload, timeout=45):
+def fetch(action, payload, timeout=45, cancel=None):
     if getattr(sys, 'frozen', False):
-        return _fetch_packaged(action, payload, timeout)
+        return _fetch_packaged(action, payload, timeout, cancel)
     ctx = mp.get_context('spawn')
     reader, writer = ctx.Pipe(duplex=False)
     process = ctx.Process(target=_worker, args=(writer,action,payload), daemon=True)
@@ -82,9 +83,13 @@ def fetch(action, payload, timeout=45):
         stage = '启动数据进程'
         deadline = started + timeout
         while True:
+            if cancel is not None and cancel.is_set():
+                return {'ok':False,'cancelled':True,'error':'同步已停止'}
             remaining = deadline-time.monotonic()
-            if remaining <= 0 or not reader.poll(remaining):
+            if remaining <= 0:
                 return {'ok': False, 'error': f'请求超过 {timeout} 秒（{stage}），已停止；不会使用旧数据触发提醒', 'elapsed_seconds': round(time.monotonic()-started,2)}
+            if not reader.poll(min(.1,remaining) if cancel is not None else remaining):
+                continue
             result = reader.recv()
             if 'progress' in result:
                 stage = result['progress']
@@ -118,18 +123,41 @@ def packaged_worker():
     _worker(StdioPipe(), request['action'], request['payload'])
 
 
-def _fetch_packaged(action, payload, timeout):
+def _stop_provider(process):
+    if process.poll() is not None:return
+    if sys.platform=='win32':
+        # PyInstaller onefile 有引导进程与工作子进程，停止时一起回收。
+        try:
+            subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),timeout=5,check=False)
+        except (OSError,subprocess.TimeoutExpired):pass
+    else:
+        import signal
+        try:os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+    if process.poll() is None:process.kill()
+
+
+def _fetch_packaged(action, payload, timeout, cancel=None):
     started = time.monotonic()
     process = subprocess.Popen([sys.executable, '--provider-worker'], stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    timed_out = False
-    try:
-        output, errors = process.communicate(json.dumps({'action':action,'payload':payload}).encode('utf-8'), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.kill()
-        output, errors = process.communicate(timeout=5)
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),start_new_session=sys.platform!='win32')
+    timed_out = cancelled = False
+    request=json.dumps({'action':action,'payload':payload}).encode('utf-8')
+    while True:
+        remaining=timeout-(time.monotonic()-started)
+        cancelled=cancel is not None and cancel.is_set()
+        if cancelled or remaining<=0:
+            timed_out=not cancelled
+            _stop_provider(process)
+            output,errors=process.communicate(timeout=5)
+            break
+        try:
+            output,errors=process.communicate(request,timeout=min(.1,remaining) if cancel is not None else remaining)
+            break
+        except subprocess.TimeoutExpired:
+            request=None
     stage, result = '启动数据进程', None
     for line in output.decode('utf-8', errors='replace').splitlines():
         try:
@@ -140,7 +168,9 @@ def _fetch_packaged(action, payload, timeout):
             stage = message['progress']
         elif 'ok' in message:
             result = message
-    if timed_out:
+    if cancelled:
+        result={'ok':False,'cancelled':True,'error':'同步已停止'}
+    elif timed_out:
         result = {'ok':False,'error':f'请求超过 {timeout} 秒（{stage}），已停止；不会使用旧数据触发提醒'}
     elif result is None:
         result = {'ok':False,'error':'数据进程未返回结果：'+errors.decode('utf-8', errors='replace')[-240:]}
@@ -148,6 +178,9 @@ def _fetch_packaged(action, payload, timeout):
     return result
 
 def _fetch(action, payload):
+    if action.startswith('market_'):
+        from .market_sources import query
+        return query(action,payload)
     symbol = payload.get('symbol', '600036')
     code = market_prefix(symbol) + '.' + symbol
     if action.startswith('bao_'):

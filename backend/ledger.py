@@ -374,9 +374,13 @@ def build_state(db):
     txs = rows(db, 'SELECT * FROM transactions ORDER BY date DESC,created_at DESC,rowid DESC')
     year = now().year
     dividend_txs = [t for t in txs if t['kind'] in DIVIDEND_KINDS]
-    received = sum(t['amount'] for t in dividend_txs if t['date'].startswith(str(year)))
-    dividend_years = sorted({str(year)} | {t['date'][:4] for t in dividend_txs}, reverse=True)
-    by_year = {y:[money(sum(t['amount'] for t in dividend_txs if t['date'].startswith(f'{y}-{m:02}'))) for m in range(1,13)] for y in dividend_years}
+    from .dividend_history import dividend_receipts
+    receipts = dividend_receipts(db, txs)
+    confirmed_received = sum(t['amount'] for t in dividend_txs if t['date'].startswith(str(year)))
+    received = sum(cents(t['amount']) for t in receipts if t['date'].startswith(str(year)))
+    inferred_received = sum(cents(t['amount']) for t in receipts if t['inferred'] and t['date'].startswith(str(year)))
+    dividend_years = sorted({str(year)} | {t['date'][:4] for t in receipts}, reverse=True)
+    by_year = {y:[money(sum(cents(t['amount']) for t in receipts if t['date'].startswith(f'{y}-{m:02}'))) for m in range(1,13)] for y in dividend_years}
     monthly = by_year[str(year)]
     timeline = []
     tracking_start = db.execute("SELECT value FROM meta WHERE key='tracking_start'").fetchone()[0]
@@ -422,12 +426,14 @@ def build_state(db):
     return {'today': now().date().isoformat(), 'tracking_start': tracking_start, 'timeline_start':start, 'accounts': accounts, 'holdings': holdings,
             'preferences': {'account_sort': sort_mode, 'dividend_basis': dividend_basis},
             'securities':rows(db,'SELECT * FROM securities ORDER BY name'),
+            'dividend_receipts':receipts,
             'transactions': txs, 'watchlist': watch, 'dividends': rows(db, 'SELECT * FROM dividends ORDER BY pay_date DESC,ex_date DESC'),
             'entitlements': entitlements, 'rules': rules, 'cashflows': rows(db, 'SELECT * FROM cashflows'),
             'notifications': rows(db, 'SELECT * FROM notifications ORDER BY date DESC LIMIT 100'),
             'sync': {r['key']: r['value'] for r in rows(db, 'SELECT * FROM sync_status')},
             'summary': {'total': money(total), 'stock_value': money(stock_value), 'broker_value': money(broker_cash+stock_value),
                         'broker_cash': money(broker_cash), 'received': money(received), 'annual_estimate': money(estimate),
+                        'confirmed_received':money(confirmed_received), 'inferred_received':money(inferred_received),
                         'estimated_positions': estimated_count, 'missing_dividend_positions': missing_dividends,
                         'allocation': {k: money(v) for k,v in allocation.items()}},
             'timeline': timeline, 'monthly_dividends': monthly, 'dividend_years':dividend_years, 'monthly_dividends_by_year':by_year}
