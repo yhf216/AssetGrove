@@ -1,7 +1,9 @@
 """Public market data queries, executed in isolated provider workers."""
 import re
+import time
 from datetime import timedelta
 from decimal import Decimal
+from contextlib import contextmanager
 
 from .storage import now
 from .bao_transport import safe_baostock_transport
@@ -11,7 +13,27 @@ def _records(frame):
     return frame.astype(object).where(frame.notna(),None).to_dict('records')
 
 
-def query(action, payload):
+@contextmanager
+def paced_http():
+    """Throttle paginated SDK requests inside this disposable market worker only."""
+    import requests
+    original=requests.sessions.Session.request
+    last=0.0
+    def request(session,*args,**kwargs):
+        nonlocal last
+        time.sleep(max(0,1.0-(time.monotonic()-last)))
+        last=time.monotonic()
+        return original(session,*args,**kwargs)
+    requests.sessions.Session.request=request
+    try:yield
+    finally:requests.sessions.Session.request=original
+
+
+def query(action,payload):
+    with paced_http():return _query(action,payload)
+
+
+def _query(action, payload):
     if action=='market_universe_ak':
         import akshare as ak
         result={}
@@ -95,6 +117,7 @@ def query(action, payload):
             values=[]
             while result.next():
                 values.append(dict(zip(result.fields,result.get_row_data())))
+            if result.error_code!='0':raise ValueError(result.error_msg or '历史分页查询失败')
             return values
         with safe_baostock_transport():
             login=bs.login()
@@ -106,9 +129,11 @@ def query(action, payload):
                 if action=='market_calendar':
                     return consume(bs.query_trade_dates(start_date=payload['start'],end_date=payload['end']))
                 records, completed, errors = [], [], []
-                for code in payload['symbols']:
+                for index,code in enumerate(payload['symbols']):
+                    if index:time.sleep(max(0,float(payload.get('request_interval',1.0))))
                     try:
                         values=consume(bs.query_history_k_data_plus(code,'date,code,close,preclose,volume,pctChg,tradestatus',start_date=payload['start'],end_date=payload['end'],frequency='d',adjustflag='3'))
+                        if not values:raise ValueError('历史响应为空，保留缺口等待重试')
                         records.extend(values);completed.append(code)
                     except Exception as exc:
                         errors.append({'symbol':code,'error':str(exc)[:160]})

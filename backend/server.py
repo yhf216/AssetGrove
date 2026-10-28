@@ -140,6 +140,7 @@ def create_app(database=None, token=None, background=True):
     async def lifespan(app):
         if background:
             threading.Thread(target=service.loop,daemon=True).start()
+            market.scheduler.start()
         yield
         service.stop.set()
         market.shutdown()
@@ -177,13 +178,20 @@ def create_app(database=None, token=None, background=True):
         if kind not in {'indices','history'}:raise ValueError('无效同步任务')
         if kind=='history':
             start=iso_date(body.get('start'));end=iso_date(body.get('end'))
+            from .market_jobs import last_closed_day
+            end=min(end,last_closed_day(market.store))
             if start>end:raise ValueError('开始日期不能晚于结束日期')
         else:start=end=None
         return {'started':market.start(kind,start,end)}
 
     @app.post('/api/market/cancel',dependencies=[Depends(auth)])
     def market_cancel():
-        market.cancel.set()
+        market.pause()
+        return {'ok':True}
+
+    @app.post('/api/market/background',dependencies=[Depends(auth)])
+    def market_background(body:dict):
+        market.background(body.get('enabled'))
         return {'ok':True}
 
     @app.exception_handler(ValueError)

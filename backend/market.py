@@ -1,5 +1,6 @@
 """Independent public market cache and resumable breadth jobs. No portfolio access."""
 from collections import defaultdict
+from bisect import bisect_left
 from contextlib import contextmanager
 from datetime import date, timedelta
 import json
@@ -7,6 +8,7 @@ import math
 from pathlib import Path
 import sqlite3
 import threading
+import time
 
 from .providers import fetch
 from .storage import now, rows
@@ -94,6 +96,25 @@ class MarketStore:
             except BaseException:db.rollback();raise
             finally:db.close()
 
+    def setting(self,key,value=None,write=False,default=None):
+        with self.connect() as db:
+            if write:
+                db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,json.dumps(value,ensure_ascii=False)))
+                return value
+            row=db.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
+            return json.loads(row[0]) if row else default
+
+    def history_gaps(self,start,end):
+        """Verify actual daily rows; old completion markers can contain empty responses."""
+        with self.connect() as db:
+            days=[r['date'] for r in rows(db,'SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(start,end))]
+            universe=rows(db,'SELECT * FROM universe ORDER BY symbol')
+            counts={r['symbol']:r['n'] for r in rows(db,"SELECT b.symbol,COUNT(*) n FROM breadth b JOIN calendar c ON c.date=b.date AND c.trading=1 JOIN universe u ON u.symbol=b.symbol WHERE b.date BETWEEN ? AND ? AND b.date>=u.ipo AND (u.out_date='' OR b.date<u.out_date) AND (b.trading=0 OR (b.change IS NOT NULL AND b.volume>=0)) GROUP BY b.symbol",(start,end))}
+        expected={r['symbol']:max(0,bisect_left(days,r['out_date'])-bisect_left(days,r['ipo'])) if r['out_date'] else len(days)-bisect_left(days,r['ipo']) for r in universe}
+        expected={s:n for s,n in expected.items() if n>0}
+        missing=sorted((s for s,n in expected.items() if counts.get(s,0)<n),key=lambda s:(counts.get(s,0),s))
+        return expected,missing
+
     def preferences(self,body=None):
         with self.connect() as db:
             old=db.execute("SELECT value FROM meta WHERE key='preferences'").fetchone()
@@ -164,7 +185,7 @@ class MarketStore:
             if cancel is not None and cancel.is_set():return
             if progress:progress(day)
             with self.connect() as db:
-                expected={s['symbol'] for s in universe if s['ipo']<=day and (not s['out_date'] or s['out_date']>=day)}
+                expected={s['symbol'] for s in universe if s['ipo']<=day and (not s['out_date'] or s['out_date']>day)}
                 observed=[r for r in rows(db,'SELECT symbol,change,volume,trading FROM breadth WHERE date=?',(day,)) if r['symbol'] in expected]
                 actual={r['symbol'] for r in observed}
                 coverage=len(actual & expected)/len(expected) if expected else 0
@@ -179,11 +200,30 @@ class MarketService:
     def __init__(self,store):
         self.store=store;self.lock=threading.Lock();self.cancel=threading.Event()
         self.progress={'running':False,'phase':'','done':0,'total':0,'errors':[],'revision':0}
-        self.thread=None
+        self.thread=None;self.request_interval=1.5;self.last_request=0
+        from .market_jobs import MarketScheduler
+        self.scheduler=MarketScheduler(self)
 
     def shutdown(self):
+        self.scheduler.stop.set()
         self.cancel.set()
         if self.thread and self.thread.is_alive():self.thread.join(timeout=2)
+
+    def pause(self):
+        self.store.setting('history_enabled',False,write=True)
+        self.cancel.set()
+
+    def background(self,enabled):
+        if type(enabled) is not bool:raise ValueError('无效的后台回补设置')
+        self.store.setting('history_enabled',enabled,write=True)
+        if enabled:self.store.setting('history_next_at',0,write=True)
+        elif self.progress.get('kind')=='history':self.cancel.set()
+
+    def request(self,action,payload,timeout=60):
+        if self.cancel.wait(max(0,self.request_interval-(time.monotonic()-self.last_request))):
+            return {'ok':False,'cancelled':True,'error':'同步已停止'}
+        self.last_request=time.monotonic()
+        return fetch(action,payload,timeout=timeout,cancel=self.cancel)
 
     def state(self):
         with self.lock:
@@ -191,7 +231,8 @@ class MarketService:
         with self.store.connect() as db:
             stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM trin WHERE value IS NOT NULL').fetchone()
             latest=db.execute('SELECT * FROM trin WHERE value IS NOT NULL ORDER BY date DESC LIMIT 1').fetchone()
-        return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path)}
+        return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
+                'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':'18:00','error':self.store.setting('background_error',default='')}}
 
     def update(self,**values):
         with self.lock:self.progress.update(values)
@@ -199,18 +240,32 @@ class MarketService:
     def changed(self):
         with self.lock:self.progress['revision']+=1
 
-    def start(self,kind='indices',start=None,end=None):
+    def start(self,kind='indices',start=None,end=None,budget=None,managed=False,daily_target=None):
         with self.lock:
             if self.progress['running']:return False
-            self.progress.update(running=True,phase='准备同步',done=0,total=0,errors=[])
+            self.progress.update(running=True,kind=kind,phase='准备同步',done=0,total=0,errors=[])
             self.cancel.clear()
+        if kind=='indices':
+            from .market_jobs import last_closed_day
+            daily_target=daily_target or last_closed_day(self.store)
+            self.store.setting('daily_attempt',daily_target,write=True)
+        elif not managed:
+            self.store.setting('history_plan',{'start':start,'end':end},write=True)
+            self.store.setting('history_enabled',True,write=True)
+        if kind=='history' and budget is None:budget=75
         def work():
             try:
-                if kind=='history':self.backfill(start,end)
-                else:self.sync_indices()
+                if kind=='history':
+                    result=self.backfill(start,end,budget=budget)
+                    if not self.cancel.is_set():self.scheduler.completed(start,end,result)
+                else:
+                    self.sync_indices()
+                    if not self.cancel.is_set() and not self.progress['errors']:
+                        self.store.setting('daily_success',daily_target,write=True)
             except Exception as exc:
                 if not self.cancel.is_set():
                     with self.lock:self.progress['errors'].append(str(exc)[:350])
+                    self.store.setting('history_next_at',now().timestamp()+900,write=True)
             finally:
                 self.update(running=False,phase='已停止' if self.cancel.is_set() else '同步结束')
                 self.changed()
@@ -230,7 +285,7 @@ class MarketService:
             errors=[]
             for action in actions:
                 if self.cancel.is_set():return
-                result=fetch(action,{'symbol':symbol,'start':start},timeout=60,cancel=self.cancel)
+                result=self.request(action,{'symbol':symbol,'start':start},timeout=60)
                 try:
                     if not result['ok']:raise ValueError(result.get('error','数据源无响应'))
                     self.store.save_index(symbol,result['data']);self.changed();break
@@ -239,57 +294,94 @@ class MarketService:
                 with self.lock:self.progress['errors'].append(index['name']+'：'+'；'.join(errors))
         if self.cancel.is_set():return
         self.update(phase='同步沪深市场 TRIN',done=len(INDICES))
-        result=fetch('market_snapshot',{},timeout=180,cancel=self.cancel)
+        result=self.request('market_snapshot',{},timeout=180)
         if not result['ok']:raise ValueError(result.get('error','市场快照失败'))
         self.store.save_snapshot(result['data']);self.changed();self.update(done=len(INDICES)+1)
 
-    def backfill(self,start,end):
+    def backfill(self,start,end,budget=None):
         start=date.fromisoformat(start).isoformat();end=date.fromisoformat(end).isoformat()
         if start>end or start<'1990-01-01' or end>now().date().isoformat():raise ValueError('历史回补日期应在 1990 年至今天之间')
-        self.update(phase='读取历史上市与退市证券目录')
-        universe=fetch('market_universe',{},timeout=60,cancel=self.cancel)
-        if not universe['ok'] and not self.cancel.is_set():
-            self.update(phase='切换历史证券目录备用源')
-            universe=fetch('market_universe_ak',{},timeout=150,cancel=self.cancel)
-        if not universe['ok']:raise ValueError(universe.get('error','历史证券目录失败'))
-        if len(universe['data'])<3000:raise ValueError('历史证券目录不完整')
-        calendar=fetch('market_calendar',{'start':start,'end':end},timeout=60,cancel=self.cancel)
-        if not calendar['ok'] and not self.cancel.is_set():calendar=fetch('market_calendar_ak',{'start':start,'end':end},timeout=60,cancel=self.cancel)
-        if not calendar['ok']:raise ValueError(calendar.get('error','交易日历失败'))
+        began=time.monotonic()
         with self.store.connect() as db:
-            db.execute('DELETE FROM universe')
-            db.executemany('INSERT INTO universe VALUES(?,?,?,?)',[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in universe['data']])
-            db.executemany('INSERT OR REPLACE INTO calendar VALUES(?,?)',[(r['calendar_date'],int(r['is_trading_day'])) for r in calendar['data']])
-            eligible=[r['symbol'] for r in rows(db,'SELECT * FROM universe') if r['ipo']<=end and (not r['out_date'] or r['out_date']>=start)]
-            missing=[symbol for symbol in eligible if not db.execute('SELECT 1 FROM fetch_ranges WHERE symbol=? AND start<=? AND end>=?',(symbol,start,end)).fetchone()]
-        self.update(total=len(eligible),done=len(eligible)-len(missing))
-        completed_count=len(eligible)-len(missing)
-        for offset in range(0,len(missing),12):
+            count=db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]
+            calendar_count=db.execute('SELECT COUNT(*) FROM calendar WHERE date BETWEEN ? AND ?',(start,end)).fetchone()[0]
+        if count>=3000 and self.store.setting('universe_date') is None:
+            with self.store.connect() as db:cached_date=db.execute('SELECT MAX(updated_at) FROM index_info').fetchone()[0]
+            self.store.setting('universe_date',(cached_date or '')[:10],write=True)
+        if count<3000 or self.store.setting('universe_date')!=now().date().isoformat():
+            self.update(phase='读取历史上市与退市证券目录')
+            universe=self.request('market_universe',{},timeout=60)
+            if not universe['ok'] and not self.cancel.is_set():universe=self.request('market_universe_ak',{},timeout=150)
+            if not universe['ok'] or len(universe['data'])<3000:
+                if count<3000 or end>self.store.setting('universe_date',default=''):
+                    raise ValueError(universe.get('error','历史证券目录不完整'))
+            else:
+                with self.store.connect() as db:
+                    db.execute('DELETE FROM universe')
+                    db.executemany('INSERT INTO universe VALUES(?,?,?,?)',[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in universe['data']])
+                self.store.setting('universe_date',now().date().isoformat(),write=True)
+        if calendar_count!=(date.fromisoformat(end)-date.fromisoformat(start)).days+1:
+            self.update(phase='读取交易日历')
+            calendar=self.request('market_calendar',{'start':start,'end':end},timeout=60)
+            if not calendar['ok'] and not self.cancel.is_set():calendar=self.request('market_calendar_ak',{'start':start,'end':end},timeout=60)
+            if not calendar['ok']:raise ValueError(calendar.get('error','交易日历失败'))
+            trading={r['calendar_date']:int(r['is_trading_day']) for r in calendar['data']}
+            days=[str(date.fromisoformat(start)+timedelta(days=i)) for i in range((date.fromisoformat(end)-date.fromisoformat(start)).days+1)]
+            with self.store.connect() as db:db.executemany('INSERT OR REPLACE INTO calendar VALUES(?,?)',[(d,trading.get(d,0)) for d in days])
+        if self.cancel.is_set():return
+        expected,missing=self.store.history_gaps(start,end)
+        self.update(total=len(expected),done=len(expected)-len(missing))
+        failures=self.store.setting('history_failures',default={})
+        retry_key=lambda code:code+':'+start+':'+end
+        waiting=[s for s in missing if failures.get(retry_key(s),{}).get('next',0)>now().timestamp()]
+        ready=[s for s in missing if s not in waiting]
+        completed_count=len(expected)-len(missing)
+        for offset in range(0,len(ready),8):
             if self.cancel.is_set():break
-            batch=missing[offset:offset+12];self.update(phase=f'回补证券 {offset+1}–{min(offset+12,len(missing))} / {len(missing)}')
-            response=fetch('market_breadth_batch',{'symbols':batch,'start':start,'end':end},timeout=120,cancel=self.cancel)
-            if not response['ok'] and not self.cancel.is_set():
-                partial={'records':[],'completed':[],'errors':[]}
-                for code in batch:
-                    if self.cancel.is_set():break
-                    fallback=fetch('market_breadth_stock_ak',{'symbol':code,'start':start,'end':end},timeout=40,cancel=self.cancel)
-                    if fallback['ok']:
-                        partial['records'].extend(fallback['data']['records']);partial['completed'].extend(fallback['data']['completed'])
-                    else:partial['errors'].append({'symbol':code,'error':fallback.get('error','备用源失败')})
-                response={'ok':True,'data':partial}
-            if not response['ok']:raise ValueError(response.get('error','历史分批查询失败；已完成批次保留'))
-            data=response['data']
+            batch=ready[offset:offset+8];self.update(phase=f'补齐历史缺口 {completed_count} / {len(expected)}')
+            response=self.request('market_breadth_batch',{'symbols':batch,'start':start,'end':end,'request_interval':1.0},timeout=120)
+            if self.cancel.is_set():return
+            data=response['data'] if response['ok'] else {'records':[],'completed':[],'errors':[{'symbol':s,'error':response.get('error','历史查询失败')} for s in batch]}
+            # Repeated BaoStock empty/partial responses switch this stock to the backup source.
+            retrying=[s for s in batch if failures.get(retry_key(s),{}).get('attempts',0)>0]
+            for code in retrying:
+                if self.cancel.is_set():return
+                fallback=self.request('market_breadth_stock_ak',{'symbol':code,'start':start,'end':end},timeout=40)
+                if fallback['ok']:data['records'].extend(fallback['data']['records'])
             with self.store.connect() as db:
                 values=[]
                 for r in data['records']:
-                    change=finite(r['pctChg']) if r.get('pctChg') else None
-                    volume=finite(r['volume']) if r.get('volume') else 0
-                    values.append((r['code'],r['date'],change,volume,int(r.get('tradestatus') or 0)))
+                    if r['code'] not in batch or not start<=r['date']<=end:continue
+                    try:
+                        change=finite(r['pctChg']) if r.get('pctChg') not in {None,''} else None
+                        volume=finite(r['volume']) if r.get('volume') not in {None,''} else 0
+                        trading=int(r.get('tradestatus') or 0)
+                        if volume<0 or (trading and change is None):continue
+                        values.append((r['code'],r['date'],change,volume,trading))
+                    except (ValueError,TypeError):continue
                 db.executemany('INSERT OR REPLACE INTO breadth VALUES(?,?,?,?,?)',values)
-                db.executemany('INSERT OR IGNORE INTO fetch_ranges VALUES(?,?,?)',[(code,start,end) for code in data['completed']])
-            completed_count+=len(data['completed'])
+            _,still_missing=self.store.history_gaps(start,end)
+            errors={r['symbol']:r['error'] for r in data['errors']}
+            for code in batch:
+                key=retry_key(code)
+                if code not in still_missing:
+                    failures.pop(key,None)
+                    with self.store.connect() as db:db.execute('INSERT OR IGNORE INTO fetch_ranges VALUES(?,?,?)',(code,start,end))
+                else:
+                    attempts=failures.get(key,{}).get('attempts',0)+1
+                    failures[key]={'attempts':attempts,'next':now().timestamp()+min(21600,120*2**min(attempts-1,8))}
+                    with self.lock:self.progress['errors'].append(code+'：'+errors.get(code,'历史行数不足，已保存有效数据并延后重试'))
+            self.store.setting('history_failures',failures,write=True)
+            completed_count=len(expected)-len(still_missing)
             self.update(done=completed_count)
-            if data['errors']:
-                with self.lock:self.progress['errors'].extend(r['symbol']+'：'+r['error'] for r in data['errors'])
+            if budget is not None and time.monotonic()-began>=budget:break
+        if self.cancel.is_set():return
         self.update(phase='汇总历史 TRIN')
         self.store.reconstruct(start,end,cancel=self.cancel,progress=lambda day:self.update(phase='汇总历史 TRIN '+day));self.changed()
+        _,remaining=self.store.history_gaps(start,end)
+        self.update(done=len(expected)-len(remaining))
+        wait=30
+        if remaining:
+            retries=[failures.get(retry_key(s),{}).get('next',0) for s in remaining]
+            if all(t>now().timestamp() for t in retries):wait=max(30,min(retries)-now().timestamp())
+        return {'complete':not remaining,'wait':wait}
