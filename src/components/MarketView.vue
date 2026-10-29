@@ -12,7 +12,7 @@ let timer:ReturnType<typeof setInterval>,lastRevision=-1,loaded=false,disposed=f
 let saveQueue=Promise.resolve()
 async function loadHistory(){
   const version=++request,result=await api('/market/history')
-  if(!disposed && version===request)history.value=result
+  if(!disposed && version===request){history.value=result;lastRevision=result.revision ?? lastRevision}
 }
 async function poll(){
   if(disposed)return
@@ -20,7 +20,7 @@ async function poll(){
     const value=await api('/market/state');if(disposed)return
     state.value=value
     if(!loaded){Object.assign(prefs,value.preferences);maText.value=prefs.ma_periods.join(',');loaded=true;await loadHistory()}
-    if(value.progress.revision!==lastRevision){lastRevision=value.progress.revision;await loadHistory()}
+    if(value.progress.revision>lastRevision){await loadHistory()}
   }catch(e:any){if(!disposed)error.value=e.message}
 }
 async function save(){
@@ -58,6 +58,8 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer);request++})
     </div>
     <p v-if="error" class="market-error" role="alert">{{ error }}</p>
     <div v-if="state?.progress.running" class="market-progress" role="status"><RefreshCw :size="15" class="spin" /><span>{{ state.progress.phase }}</span><progress v-if="state.progress.total" :value="state.progress.done" :max="state.progress.total" /><span v-if="state.progress.total">{{ state.progress.done }} / {{ state.progress.total }}</span></div>
+    <div v-if="state?.calculation?.running" class="market-progress" role="status"><RefreshCw :size="15" class="spin" /><span>正在用本地数据补算 TRIN</span><span v-if="state.calculation.total">{{ state.calculation.done }} / {{ state.calculation.total }}</span></div>
+    <div v-if="state?.calculation?.error" class="market-error" role="alert">{{ state.calculation.error }}</div>
     <div v-if="state?.progress.errors?.length" class="market-error" role="status"><div v-for="message in state.progress.errors.slice(-4)" :key="message">{{ message }}</div></div>
     <article class="panel market-plot"><MarketChart v-if="history" :history="history" :catalog="state?.catalog || []" /><div v-else class="empty-chart">正在读取市场缓存…</div></article>
     <div class="market-data-row"><span v-for="entry in history?.coverage?.filter((r:any)=>prefs.symbols.includes(r.symbol)) || []" :key="entry.symbol" :title="entry.source">{{ state?.catalog.find((r:any)=>r.symbol===entry.symbol)?.name }} {{ entry.first_date }} — {{ entry.last_date }}</span></div>
