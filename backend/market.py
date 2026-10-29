@@ -1,5 +1,6 @@
 """Independent public market cache and resumable breadth jobs. No portfolio access."""
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from copy import deepcopy
 from bisect import bisect_left
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -12,6 +13,7 @@ import time
 
 from .providers import fetch
 from .storage import now, rows
+from .market_cache import install_cache, calculate_trin
 
 INDICES = [
     {'symbol':'sh000001','name':'上证指数'}, {'symbol':'sz399102','name':'创业板综指'},
@@ -86,7 +88,12 @@ class MarketStore:
     def __init__(self,path):
         self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True)
         self.lock=threading.RLock()
-        with self.connect() as db:db.executescript(SCHEMA)
+        self.calculation_lock=threading.Lock()
+        self.history_cache=OrderedDict();self.cached_revision=-1
+        with self.connect() as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.executescript(SCHEMA)
+            install_cache(db)
 
     @contextmanager
     def connect(self):
@@ -104,16 +111,118 @@ class MarketStore:
             row=db.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
             return json.loads(row[0]) if row else default
 
-    def history_gaps(self,start,end):
+    def history_gaps(self,start,end,symbols=None):
         """Verify actual daily rows; old completion markers can contain empty responses."""
+        if symbols is not None and not symbols:return {},[]
         with self.connect() as db:
             days=[r['date'] for r in rows(db,'SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(start,end))]
+            clause=' AND b.symbol IN ('+','.join('?' for _ in symbols)+')' if symbols else ''
             universe=rows(db,'SELECT * FROM universe ORDER BY symbol')
-            counts={r['symbol']:r['n'] for r in rows(db,"SELECT b.symbol,COUNT(*) n FROM breadth b JOIN calendar c ON c.date=b.date AND c.trading=1 JOIN universe u ON u.symbol=b.symbol WHERE b.date BETWEEN ? AND ? AND b.date>=u.ipo AND (u.out_date='' OR b.date<u.out_date) AND (b.trading=0 OR (b.change IS NOT NULL AND b.volume>=0)) GROUP BY b.symbol",(start,end))}
+            if symbols is not None:universe=[r for r in universe if r['symbol'] in symbols]
+            counts={r['symbol']:r['n'] for r in rows(db,"SELECT b.symbol,COUNT(*) n FROM breadth b JOIN calendar c ON c.date=b.date AND c.trading=1 JOIN universe u ON u.symbol=b.symbol WHERE b.date BETWEEN ? AND ? AND b.date>=u.ipo AND (u.out_date='' OR b.date<u.out_date) AND (b.trading=0 OR (b.change IS NOT NULL AND b.volume>=0))"+clause+' GROUP BY b.symbol',(start,end,*(symbols or [])))}
         expected={r['symbol']:max(0,bisect_left(days,r['out_date'])-bisect_left(days,r['ipo'])) if r['out_date'] else len(days)-bisect_left(days,r['ipo']) for r in universe}
         expected={s:n for s,n in expected.items() if n>0}
         missing=sorted((s for s,n in expected.items() if counts.get(s,0)<n),key=lambda s:(counts.get(s,0),s))
         return expected,missing
+
+    def missing_ranges(self,symbol,start,end):
+        with self.connect() as db:
+            stock=db.execute('SELECT * FROM universe WHERE symbol=?',(symbol,)).fetchone()
+            if not stock:return []
+            days=[r[0] for r in db.execute("SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? AND date>=? AND (?='' OR date<?) ORDER BY date",(start,end,stock['ipo'],stock['out_date'],stock['out_date']))]
+            present={r[0] for r in db.execute('SELECT date FROM breadth WHERE symbol=? AND date BETWEEN ? AND ? AND (trading=0 OR (change IS NOT NULL AND volume>=0))',(symbol,start,end))}
+        if not days:return []
+        if not present:return [(start,end)]
+        result=[];first=last=None
+        for day in days:
+            if day in present:
+                if first:result.append((first,last));first=last=None
+            else:
+                if first is None:first=day
+                last=day
+        if first:result.append((first,last))
+        return result
+
+    def chart_revision(self):
+        with self.connect() as db:return db.execute('SELECT value FROM market_revision WHERE id=1').fetchone()[0]
+
+    def enqueue_calculations(self,start,end,changed_inputs=False):
+        with self.connect() as db:
+            clause='' if changed_inputs else ' AND t.value IS NULL'
+            db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'trin',b.date FROM breadth b LEFT JOIN trin t ON t.date=b.date WHERE b.date BETWEEN ? AND ?"+clause+' GROUP BY b.date',(start,end))
+
+    def replace_universe(self,records):
+        values=[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in records]
+        with self.connect() as db:
+            old={r['symbol']:(r['ipo'],r['out_date']) for r in rows(db,'SELECT * FROM universe')}
+            new={r[0]:(r[2],r[3]) for r in values}
+            db.execute('DELETE FROM universe')
+            db.executemany('INSERT INTO universe VALUES(?,?,?,?)',values)
+            for symbol in old.keys() | new.keys():
+                previous,current=old.get(symbol),new.get(symbol)
+                if previous==current:continue
+                boundaries=sorted({boundary for item in [previous,current] if item for boundary in [item[0],item[1] or '9999-12-31']})
+                for first,last in zip(boundaries,boundaries[1:]):
+                    active=lambda item:bool(item and item[0]<=first and (not item[1] or item[1]>first))
+                    if active(previous)!=active(current):
+                        db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'trin',date FROM breadth WHERE date>=? AND date<? GROUP BY date",(first,last))
+
+    def calendar_gaps(self,start,end):
+        with self.connect() as db:present={r[0] for r in db.execute('SELECT date FROM calendar WHERE date BETWEEN ? AND ?',(start,end))}
+        result=[];first=last=None
+        for i in range((date.fromisoformat(end)-date.fromisoformat(start)).days+1):
+            day=str(date.fromisoformat(start)+timedelta(days=i))
+            if day in present:
+                if first:result.append((first,last));first=last=None
+            else:
+                if first is None:first=day
+                last=day
+        if first:result.append((first,last))
+        return result
+
+    def index_ranges(self,symbol,target,refresh=False):
+        with self.connect() as db:
+            info=db.execute('SELECT * FROM index_info WHERE symbol=?',(symbol,)).fetchone()
+            if not info:return [('1990-01-01',target)]
+            goal=info['last_date'] if refresh and info['last_date']==now().date().isoformat() else target
+            days=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(info['first_date'],goal))]
+            present={r[0] for r in db.execute('SELECT date FROM index_bars WHERE symbol=? AND date BETWEEN ? AND ?',(symbol,info['first_date'],goal))}
+        result=[];first=last=None
+        for day in days:
+            if day in present:
+                if first:result.append((first,last));first=last=None
+            else:
+                if first is None:first=day
+                last=day
+        if first:result.append((first,last))
+        if info['last_date']<goal:result.append((str(date.fromisoformat(info['last_date'])+timedelta(days=1)),goal))
+        elif info['updated_at'][:10]<=goal and info['updated_at'][11:16]<'18:00':result.append((goal,goal))
+        merged=[]
+        for first,last in sorted(result):
+            if merged and first<=str(date.fromisoformat(merged[-1][1])+timedelta(days=1)):
+                merged[-1]=(merged[-1][0],max(last,merged[-1][1]))
+            else:merged.append((first,last))
+        return merged
+
+    def calculate_pending(self,cancel=None,budget=2,limit=128,start='1990-01-01',end=None,progress=None):
+        if not self.calculation_lock.acquire(blocking=False):return 0
+        began=time.monotonic();processed=0;end=end or now().date().isoformat()
+        try:
+            with self.connect() as db:
+                if db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]<3000:return 0
+                db.execute("DELETE FROM indicator_dirty WHERE indicator='trin' AND date IN (SELECT date FROM calendar WHERE trading=0)")
+                days=[r[0] for r in db.execute("SELECT q.date FROM indicator_dirty q JOIN calendar c ON c.date=q.date AND c.trading=1 WHERE q.indicator='trin' AND q.date BETWEEN ? AND ? AND q.not_before<=? ORDER BY q.date DESC LIMIT ?",(start,end,now().timestamp(),limit))]
+            for day in days:
+                if cancel is not None and cancel.is_set():break
+                if processed and time.monotonic()-began>=budget:break
+                with self.connect() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    if not db.execute("SELECT 1 FROM indicator_dirty WHERE indicator='trin' AND date=?",(day,)).fetchone():continue
+                    calculate_trin(db,day)
+                processed+=1
+                if progress:progress(processed,len(days))
+            return processed
+        finally:self.calculation_lock.release()
 
     def preferences(self,body=None):
         with self.connect() as db:
@@ -144,7 +253,10 @@ class MarketStore:
             values.append((symbol,day,o,h,l,c,volume,result['source']))
         if not values:raise ValueError('未收到指数历史')
         with self.connect() as db:
-            db.executemany('INSERT OR REPLACE INTO index_bars VALUES(?,?,?,?,?,?,?,?)',values)
+            db.executemany('''INSERT INTO index_bars VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(symbol,date) DO UPDATE SET
+                open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,source=excluded.source
+                WHERE index_bars.open IS NOT excluded.open OR index_bars.high IS NOT excluded.high OR index_bars.low IS NOT excluded.low
+                OR index_bars.close IS NOT excluded.close OR index_bars.volume IS NOT excluded.volume''',values)
             bounds=db.execute('SELECT MIN(date),MAX(date) FROM index_bars WHERE symbol=?',(symbol,)).fetchone()
             db.execute('INSERT OR REPLACE INTO index_info VALUES(?,?,?,?,?)',(symbol,result['source'],*bounds,now().isoformat()))
 
@@ -159,6 +271,13 @@ class MarketStore:
     def history(self):
         prefs=self.preferences()
         with self.connect() as db:
+            revision=db.execute('SELECT value FROM market_revision WHERE id=1').fetchone()[0]
+            if revision!=self.cached_revision:
+                self.history_cache.clear();self.cached_revision=revision
+            key=json.dumps(prefs,sort_keys=True)
+            if key in self.history_cache:
+                self.history_cache.move_to_end(key)
+                return deepcopy(self.history_cache[key])
             daily={s:rows(db,'SELECT date,open,high,low,close,volume FROM index_bars WHERE symbol=? ORDER BY date',(s,)) for s in prefs['symbols']}
             series={s:aggregate_bars(bars,prefs['period'],prefs['ma_periods'] if prefs['ma_enabled'] else []) for s,bars in daily.items()}
             trin=rows(db,'SELECT * FROM trin ORDER BY date')
@@ -174,50 +293,58 @@ class MarketStore:
                     day=max(expected[key] | {r['date'] for r in group})
                     result.append({**group[-1],'date':day,'value':sum(r['value'] for r in group)/len(group) if complete else None,'provisional':any(r['provisional'] for r in group),'observations':len(group),'reason':'' if complete else '所选周期的历史日值未齐'})
                 trin=result
-            return {'preferences':prefs,'series':series,'trin':trin,'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol')}
+            result={'preferences':prefs,'series':series,'trin':trin,'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
+            self.history_cache[key]=result
+            while len(self.history_cache)>3 or (len(self.history_cache)>1 and sum(sum(len(v) for v in item['series'].values())+len(item['trin']) for item in self.history_cache.values())>100000):
+                self.history_cache.popitem(last=False)
+            return deepcopy(result)
 
     def reconstruct(self,start,end,cancel=None,progress=None):
         with self.connect() as db:
-            universe=rows(db,'SELECT * FROM universe')
-            if len(universe)<3000:raise ValueError('历史证券目录不完整，未生成 TRIN')
+            if db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]<3000:raise ValueError('历史证券目录不完整，未生成 TRIN')
             days=[r['date'] for r in rows(db,'SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(start,end))]
         for day in days:
             if cancel is not None and cancel.is_set():return
             if progress:progress(day)
             with self.connect() as db:
-                expected={s['symbol'] for s in universe if s['ipo']<=day and (not s['out_date'] or s['out_date']>day)}
-                observed=[r for r in rows(db,'SELECT symbol,change,volume,trading FROM breadth WHERE date=?',(day,)) if r['symbol'] in expected]
-                actual={r['symbol'] for r in observed}
-                coverage=len(actual & expected)/len(expected) if expected else 0
-                values=trin_value(observed)
-                valid=expected and expected<=actual and values['value'] is not None
-                if not valid and db.execute('SELECT 1 FROM trin WHERE date=? AND value IS NOT NULL',(day,)).fetchone():
-                    continue  # 未完成的回补不能覆盖已经核实的市场快照。
-                db.execute('INSERT OR REPLACE INTO trin VALUES(?,?,?,?,?,?,?,?,?,?)',(day,values['value'] if valid else None,values['advances'],values['declines'],values['up_volume'],values['down_volume'],coverage,'历史全市场 / BaoStock、AKShare',0,'' if valid else '历史样本未齐，未发布数值'))
+                db.execute('BEGIN IMMEDIATE')
+                calculate_trin(db,day)
 
 
 class MarketService:
     def __init__(self,store):
         self.store=store;self.lock=threading.Lock();self.cancel=threading.Event()
         self.progress={'running':False,'phase':'','done':0,'total':0,'errors':[],'revision':0}
+        self.calculation={'running':False,'done':0,'total':0,'error':''}
+        self.calculation_cancel=threading.Event()
+        if not self.store.setting('history_enabled',default=True):self.calculation_cancel.set()
         self.thread=None;self.request_interval=1.5;self.last_request=0
+        self.index_refresh=False;self.index_target=None
         from .market_jobs import MarketScheduler
         self.scheduler=MarketScheduler(self)
 
     def shutdown(self):
         self.scheduler.stop.set()
         self.cancel.set()
-        if self.thread and self.thread.is_alive():self.thread.join(timeout=2)
+        self.calculation_cancel.set()
+        deadline=time.monotonic()+2
+        for thread in [self.thread,self.scheduler.calculation_thread]:
+            if thread and thread.is_alive():thread.join(timeout=max(0,deadline-time.monotonic()))
 
     def pause(self):
         self.store.setting('history_enabled',False,write=True)
         self.cancel.set()
+        self.calculation_cancel.set()
 
     def background(self,enabled):
         if type(enabled) is not bool:raise ValueError('无效的后台回补设置')
         self.store.setting('history_enabled',enabled,write=True)
-        if enabled:self.store.setting('history_next_at',0,write=True)
-        elif self.progress.get('kind')=='history':self.cancel.set()
+        if enabled:
+            self.store.setting('history_next_at',0,write=True)
+            self.calculation_cancel.clear()
+        else:
+            self.calculation_cancel.set()
+            if self.progress.get('kind')=='history':self.cancel.set()
 
     def request(self,action,payload,timeout=60):
         if self.cancel.wait(max(0,self.request_interval-(time.monotonic()-self.last_request))):
@@ -228,10 +355,13 @@ class MarketService:
     def state(self):
         with self.lock:
             progress={**self.progress,'errors':list(self.progress['errors'])}
+            calculation=dict(self.calculation)
+        progress['job_revision']=progress['revision']
+        progress['revision']=self.store.chart_revision()
         with self.store.connect() as db:
             stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM trin WHERE value IS NOT NULL').fetchone()
             latest=db.execute('SELECT * FROM trin WHERE value IS NOT NULL ORDER BY date DESC LIMIT 1').fetchone()
-        return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
+        return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'calculation':calculation,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
                 'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':'18:00','error':self.store.setting('background_error',default='')}}
 
     def update(self,**values):
@@ -247,11 +377,14 @@ class MarketService:
             self.cancel.clear()
         if kind=='indices':
             from .market_jobs import last_closed_day
+            self.index_refresh=daily_target is None
             daily_target=daily_target or last_closed_day(self.store)
+            self.index_target=daily_target
             self.store.setting('daily_attempt',daily_target,write=True)
         elif not managed:
             self.store.setting('history_plan',{'start':start,'end':end},write=True)
             self.store.setting('history_enabled',True,write=True)
+            self.calculation_cancel.clear()
         if kind=='history' and budget is None:budget=75
         def work():
             try:
@@ -274,25 +407,31 @@ class MarketService:
         return True
 
     def sync_indices(self):
+        from .market_jobs import last_closed_day
+        target=self.index_target or last_closed_day(self.store)
         self.update(total=len(INDICES)+1)
         for i,index in enumerate(INDICES):
             if self.cancel.is_set():return
             symbol=index['symbol'];self.update(phase='同步 '+index['name'],done=i)
             with self.store.connect() as db:
                 info=db.execute('SELECT * FROM index_info WHERE symbol=?',(symbol,)).fetchone()
-            start=(date.fromisoformat(info['last_date'])-timedelta(days=7)).isoformat() if info else '1990-01-01'
             actions=['market_index_em','market_index_sina'] if info else ['market_index_sina','market_index_em']
-            errors=[]
-            for action in actions:
-                if self.cancel.is_set():return
-                result=self.request(action,{'symbol':symbol,'start':start},timeout=60)
-                try:
-                    if not result['ok']:raise ValueError(result.get('error','数据源无响应'))
-                    self.store.save_index(symbol,result['data']);self.changed();break
-                except Exception as exc:errors.append(str(exc)[:150])
-            else:
-                with self.lock:self.progress['errors'].append(index['name']+'：'+'；'.join(errors))
+            for start,end in self.store.index_ranges(symbol,target,self.index_refresh):
+                errors=[]
+                for action in actions:
+                    if self.cancel.is_set():return
+                    result=self.request(action,{'symbol':symbol,'start':start,'end':end},timeout=60)
+                    try:
+                        if not result['ok']:raise ValueError(result.get('error','数据源无响应'))
+                        self.store.save_index(symbol,result['data']);self.changed();break
+                    except Exception as exc:errors.append(str(exc)[:150])
+                else:
+                    with self.lock:self.progress['errors'].append(index['name']+'：'+'；'.join(errors))
         if self.cancel.is_set():return
+        with self.store.connect() as db:
+            cached=db.execute('SELECT date FROM trin WHERE date>=? AND value IS NOT NULL AND provisional=0 ORDER BY date DESC LIMIT 1',(target,)).fetchone()
+        if cached and (not self.index_refresh or cached['date']>=now().date().isoformat()):
+            self.update(done=len(INDICES)+1);return
         self.update(phase='同步沪深市场 TRIN',done=len(INDICES))
         result=self.request('market_snapshot',{},timeout=180)
         if not result['ok']:raise ValueError(result.get('error','市场快照失败'))
@@ -309,82 +448,98 @@ class MarketService:
                 if volume<0 or (trading and change is None):continue
                 values.append((r['code'],r['date'],change,volume,trading))
             except (ValueError,TypeError):continue
-        with self.store.connect() as db:db.executemany('INSERT OR REPLACE INTO breadth VALUES(?,?,?,?,?)',values)
+        with self.store.connect() as db:db.executemany('''INSERT INTO breadth VALUES(?,?,?,?,?) ON CONFLICT(symbol,date) DO UPDATE SET
+            change=excluded.change,volume=excluded.volume,trading=excluded.trading
+            WHERE breadth.change IS NOT excluded.change OR breadth.volume IS NOT excluded.volume OR breadth.trading IS NOT excluded.trading''',values)
 
     def backfill(self,start,end,budget=None):
         start=date.fromisoformat(start).isoformat();end=date.fromisoformat(end).isoformat()
         if start>end or start<'1990-01-01' or end>now().date().isoformat():raise ValueError('历史回补日期应在 1990 年至今天之间')
         began=time.monotonic()
-        with self.store.connect() as db:
-            count=db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]
-            calendar_count=db.execute('SELECT COUNT(*) FROM calendar WHERE date BETWEEN ? AND ?',(start,end)).fetchone()[0]
-        if count>=3000 and self.store.setting('universe_date') is None:
-            with self.store.connect() as db:cached_date=db.execute('SELECT MAX(updated_at) FROM index_info').fetchone()[0]
-            self.store.setting('universe_date',(cached_date or '')[:10],write=True)
-        if count<3000 or self.store.setting('universe_date')!=now().date().isoformat():
+        with self.store.connect() as db:count=db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]
+        # Complete cached inputs take the offline path even if source metadata is old.
+        if count>=3000 and not self.store.calendar_gaps(start,end):
+            expected,missing=self.store.history_gaps(start,end)
+            if not missing:
+                self.update(total=len(expected),done=len(expected),phase='从缓存补算 TRIN')
+                self.store.enqueue_calculations(start,end)
+                with self.store.connect() as db:db.execute('UPDATE indicator_dirty SET not_before=0 WHERE date BETWEEN ? AND ?',(start,end))
+                self.store.calculate_pending(cancel=self.cancel,start=start,end=end)
+                return {'complete':True,'wait':30}
+        universe_date=self.store.setting('universe_date')
+        if universe_date is None and count>=3000:
+            with self.store.connect() as db:cached=db.execute('SELECT MAX(updated_at) FROM index_info').fetchone()[0]
+            universe_date=(cached or '')[:10]
+            self.store.setting('universe_date',universe_date,write=True)
+        if count<3000 or end>(universe_date or ''):
             self.update(phase='读取历史上市与退市证券目录')
             universe=self.request('market_universe',{},timeout=60)
             if not universe['ok'] and not self.cancel.is_set():universe=self.request('market_universe_ak',{},timeout=150)
-            if not universe['ok'] or len(universe['data'])<3000:
-                if count<3000 or end>self.store.setting('universe_date',default=''):
-                    raise ValueError(universe.get('error','历史证券目录不完整'))
-            else:
-                with self.store.connect() as db:
-                    db.execute('DELETE FROM universe')
-                    db.executemany('INSERT INTO universe VALUES(?,?,?,?)',[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in universe['data']])
-                self.store.setting('universe_date',now().date().isoformat(),write=True)
-        if calendar_count!=(date.fromisoformat(end)-date.fromisoformat(start)).days+1:
-            self.update(phase='读取交易日历')
-            calendar=self.request('market_calendar',{'start':start,'end':end},timeout=60)
-            if not calendar['ok'] and not self.cancel.is_set():calendar=self.request('market_calendar_ak',{'start':start,'end':end},timeout=60)
-            if not calendar['ok']:raise ValueError(calendar.get('error','交易日历失败'))
+            if not universe['ok'] or len(universe['data'])<3000:raise ValueError(universe.get('error','历史证券目录不完整'))
+            self.store.replace_universe(universe['data'])
+            self.store.setting('universe_date',now().date().isoformat(),write=True)
+        for first,last in self.store.calendar_gaps(start,end):
+            if self.cancel.is_set():return
+            self.update(phase='补齐交易日历 '+first+' — '+last)
+            payload={'start':first,'end':last}
+            calendar=self.request('market_calendar',payload,timeout=60)
+            if not calendar['ok'] and not self.cancel.is_set():calendar=self.request('market_calendar_ak',payload,timeout=60)
+            if not calendar['ok'] or not calendar['data']:raise ValueError(calendar.get('error','交易日历为空，等待重试'))
             trading={r['calendar_date']:int(r['is_trading_day']) for r in calendar['data']}
-            days=[str(date.fromisoformat(start)+timedelta(days=i)) for i in range((date.fromisoformat(end)-date.fromisoformat(start)).days+1)]
-            with self.store.connect() as db:db.executemany('INSERT OR REPLACE INTO calendar VALUES(?,?)',[(d,trading.get(d,0)) for d in days])
+            days=[str(date.fromisoformat(first)+timedelta(days=i)) for i in range((date.fromisoformat(last)-date.fromisoformat(first)).days+1)]
+            with self.store.connect() as db:db.executemany('INSERT INTO calendar VALUES(?,?) ON CONFLICT(date) DO UPDATE SET trading=excluded.trading WHERE calendar.trading IS NOT excluded.trading',[(d,trading.get(d,0)) for d in days])
         if self.cancel.is_set():return
         expected,missing=self.store.history_gaps(start,end)
+        missing=set(missing)
         self.update(total=len(expected),done=len(expected)-len(missing))
         failures=self.store.setting('history_failures',default={})
         retry_key=lambda code:code+':'+start+':'+end
-        waiting=[s for s in missing if failures.get(retry_key(s),{}).get('next',0)>now().timestamp()]
-        ready=[s for s in missing if s not in waiting]
-        completed_count=len(expected)-len(missing)
-        for offset in range(0,len(ready),8):
-            if self.cancel.is_set():break
-            batch=ready[offset:offset+8];self.update(phase=f'补齐历史缺口 {completed_count} / {len(expected)}')
-            response=self.request('market_breadth_batch',{'symbols':batch,'start':start,'end':end,'request_interval':1.0},timeout=120)
-            if self.cancel.is_set():return
-            data=response['data'] if response['ok'] else {'records':[],'completed':[],'errors':[{'symbol':s,'error':response.get('error','历史查询失败')} for s in batch]}
-            self.save_breadth(data['records'],batch,start,end)
-            _,still_missing=self.store.history_gaps(start,end)
-            # Repeated BaoStock empty/partial responses switch this stock to the backup source.
-            retrying=[s for s in batch if s in still_missing and failures.get(retry_key(s),{}).get('attempts',0)>0]
-            for code in retrying:
+        plans=defaultdict(list)
+        for symbol in sorted(missing):
+            if failures.get(retry_key(symbol),{}).get('next',0)>now().timestamp():continue
+            for first,last in self.store.missing_ranges(symbol,start,end):plans[(first,last)].append(symbol)
+        exhausted=False
+        for (first,last),symbols in sorted(plans.items(),key=lambda item:(item[0][1],item[0][0]),reverse=True):
+            for offset in range(0,len(symbols),8):
                 if self.cancel.is_set():return
-                fallback=self.request('market_breadth_stock_ak',{'symbol':code,'start':start,'end':end},timeout=40)
-                if fallback['ok']:self.save_breadth(fallback['data']['records'],[code],start,end)
-            if retrying:_,still_missing=self.store.history_gaps(start,end)
-            errors={r['symbol']:r['error'] for r in data['errors']}
-            for code in batch:
-                key=retry_key(code)
-                if code not in still_missing:
-                    failures.pop(key,None)
-                    with self.store.connect() as db:db.execute('INSERT OR IGNORE INTO fetch_ranges VALUES(?,?,?)',(code,start,end))
-                else:
-                    attempts=failures.get(key,{}).get('attempts',0)+1
-                    failures[key]={'attempts':attempts,'next':now().timestamp()+min(21600,120*2**min(attempts-1,8))}
-                    with self.lock:self.progress['errors'].append(code+'：'+errors.get(code,'历史行数不足，已保存有效数据并延后重试'))
-            self.store.setting('history_failures',failures,write=True)
-            completed_count=len(expected)-len(still_missing)
-            self.update(done=completed_count)
-            if budget is not None and time.monotonic()-began>=budget:break
+                batch=[s for s in symbols[offset:offset+8] if failures.get(retry_key(s),{}).get('next',0)<=now().timestamp()]
+                if not batch:continue
+                self.update(phase=f'补齐历史缺口 {len(expected)-len(missing)} / {len(expected)}')
+                response=self.request('market_breadth_batch',{'symbols':batch,'start':first,'end':last,'request_interval':1.0},timeout=120)
+                if self.cancel.is_set():return
+                data=response['data'] if response['ok'] else {'records':[],'completed':[],'errors':[{'symbol':s,'error':response.get('error','历史查询失败')} for s in batch]}
+                self.save_breadth(data['records'],batch,first,last)
+                _,gap_missing=self.store.history_gaps(first,last,symbols=batch)
+                retrying=[s for s in batch if s in gap_missing and failures.get(retry_key(s),{}).get('attempts',0)>0]
+                for code in retrying:
+                    if self.cancel.is_set():return
+                    fallback=self.request('market_breadth_stock_ak',{'symbol':code,'start':first,'end':last},timeout=40)
+                    if fallback['ok']:self.save_breadth(fallback['data']['records'],[code],first,last)
+                if retrying:_,gap_missing=self.store.history_gaps(first,last,symbols=batch)
+                _,remaining=self.store.history_gaps(start,end,symbols=batch)
+                missing.difference_update(batch);missing.update(remaining)
+                errors={r['symbol']:r['error'] for r in data['errors']}
+                for code in batch:
+                    key=retry_key(code)
+                    if code not in gap_missing:
+                        with self.store.connect() as db:db.execute('INSERT OR IGNORE INTO fetch_ranges VALUES(?,?,?)',(code,first,last))
+                        if code not in missing:failures.pop(key,None)
+                    else:
+                        attempts=failures.get(key,{}).get('attempts',0)+1
+                        failures[key]={'attempts':attempts,'next':now().timestamp()+min(21600,120*2**min(attempts-1,8))}
+                        with self.lock:self.progress['errors'].append(code+'：'+errors.get(code,'历史行数不足，已保存有效数据并延后重试'))
+                self.store.setting('history_failures',failures,write=True)
+                self.update(done=len(expected)-len(missing))
+                if budget is not None and time.monotonic()-began>=budget:exhausted=True;break
+            if exhausted:break
         if self.cancel.is_set():return
-        self.update(phase='汇总历史 TRIN')
-        self.store.reconstruct(start,end,cancel=self.cancel,progress=lambda day:self.update(phase='汇总历史 TRIN '+day));self.changed()
-        _,remaining=self.store.history_gaps(start,end)
-        self.update(done=len(expected)-len(remaining))
+        self.update(phase='从缓存补算 TRIN')
+        self.store.enqueue_calculations(start,end)
+        if not missing:
+            with self.store.connect() as db:db.execute('UPDATE indicator_dirty SET not_before=0 WHERE date BETWEEN ? AND ?',(start,end))
+        self.store.calculate_pending(cancel=self.cancel,start=start,end=end)
         wait=30
-        if remaining:
-            retries=[failures.get(retry_key(s),{}).get('next',0) for s in remaining]
+        if missing:
+            retries=[failures.get(retry_key(s),{}).get('next',0) for s in missing]
             if all(t>now().timestamp() for t in retries):wait=max(30,min(retries)-now().timestamp())
-        return {'complete':not remaining,'wait':wait}
+        return {'complete':not missing,'wait':wait}

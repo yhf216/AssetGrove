@@ -16,11 +16,32 @@ def last_closed_day(store,moment=None):
 
 class MarketScheduler:
     def __init__(self,service):
-        self.service=service;self.store=service.store;self.stop=threading.Event();self.thread=None
+        self.service=service;self.store=service.store;self.stop=threading.Event();self.thread=None;self.calculation_thread=None
 
     def start(self):
         self.thread=threading.Thread(target=self.loop,daemon=True)
         self.thread.start()
+        self.calculation_thread=threading.Thread(target=self.calculation_loop,daemon=True)
+        self.calculation_thread.start()
+
+    def calculation_loop(self):
+        if self.stop.wait(1):return
+        while not self.stop.is_set():
+            self.calculate()
+            if self.stop.wait(5):return
+
+    def calculate(self):
+        if self.stop.is_set() or not self.store.setting('history_enabled',default=True):return 0
+        with self.service.lock:self.service.calculation.update(running=True,done=0,total=0,error='')
+        try:
+            def progress(done,total):
+                with self.service.lock:self.service.calculation.update(done=done,total=total)
+            return self.store.calculate_pending(cancel=self.service.calculation_cancel,progress=progress)
+        except Exception as exc:
+            with self.service.lock:self.service.calculation['error']=str(exc)[:250]
+            return 0
+        finally:
+            with self.service.lock:self.service.calculation['running']=False
 
     def loop(self):
         while not self.stop.wait(20):
