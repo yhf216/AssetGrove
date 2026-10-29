@@ -6,7 +6,7 @@ from decimal import Decimal
 from contextlib import contextmanager
 
 from .storage import now
-from .bao_transport import safe_baostock_transport
+from .bao_transport import BaoTransportError, safe_baostock_transport
 
 
 def _records(frame):
@@ -135,6 +135,10 @@ def _query(action, payload):
                         values=consume(bs.query_history_k_data_plus(code,'date,code,close,preclose,volume,pctChg,tradestatus',start_date=payload['start'],end_date=payload['end'],frequency='d',adjustflag='3'))
                         if not values:raise ValueError('历史响应为空，保留缺口等待重试')
                         records.extend(values);completed.append(code)
+                    except BaoTransportError as exc:
+                        errors.append({'symbol':code,'error':str(exc)[:160]})
+                        errors.extend({'symbol':s,'error':'BaoStock 连接已中断，已保留缺口，稍后重新连接'} for s in payload['symbols'][index+1:])
+                        break
                     except Exception as exc:
                         errors.append({'symbol':code,'error':str(exc)[:160]})
                 return {'records':records,'completed':completed,'errors':errors}

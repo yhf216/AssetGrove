@@ -298,6 +298,19 @@ class MarketService:
         if not result['ok']:raise ValueError(result.get('error','市场快照失败'))
         self.store.save_snapshot(result['data']);self.changed();self.update(done=len(INDICES)+1)
 
+    def save_breadth(self,records,allowed,start,end):
+        values=[]
+        for r in records:
+            if r['code'] not in allowed or not start<=r['date']<=end:continue
+            try:
+                change=finite(r['pctChg']) if r.get('pctChg') not in {None,''} else None
+                volume=finite(r['volume']) if r.get('volume') not in {None,''} else 0
+                trading=int(r.get('tradestatus') or 0)
+                if volume<0 or (trading and change is None):continue
+                values.append((r['code'],r['date'],change,volume,trading))
+            except (ValueError,TypeError):continue
+        with self.store.connect() as db:db.executemany('INSERT OR REPLACE INTO breadth VALUES(?,?,?,?,?)',values)
+
     def backfill(self,start,end,budget=None):
         start=date.fromisoformat(start).isoformat();end=date.fromisoformat(end).isoformat()
         if start>end or start<'1990-01-01' or end>now().date().isoformat():raise ValueError('历史回补日期应在 1990 年至今天之间')
@@ -342,25 +355,15 @@ class MarketService:
             response=self.request('market_breadth_batch',{'symbols':batch,'start':start,'end':end,'request_interval':1.0},timeout=120)
             if self.cancel.is_set():return
             data=response['data'] if response['ok'] else {'records':[],'completed':[],'errors':[{'symbol':s,'error':response.get('error','历史查询失败')} for s in batch]}
+            self.save_breadth(data['records'],batch,start,end)
+            _,still_missing=self.store.history_gaps(start,end)
             # Repeated BaoStock empty/partial responses switch this stock to the backup source.
-            retrying=[s for s in batch if failures.get(retry_key(s),{}).get('attempts',0)>0]
+            retrying=[s for s in batch if s in still_missing and failures.get(retry_key(s),{}).get('attempts',0)>0]
             for code in retrying:
                 if self.cancel.is_set():return
                 fallback=self.request('market_breadth_stock_ak',{'symbol':code,'start':start,'end':end},timeout=40)
-                if fallback['ok']:data['records'].extend(fallback['data']['records'])
-            with self.store.connect() as db:
-                values=[]
-                for r in data['records']:
-                    if r['code'] not in batch or not start<=r['date']<=end:continue
-                    try:
-                        change=finite(r['pctChg']) if r.get('pctChg') not in {None,''} else None
-                        volume=finite(r['volume']) if r.get('volume') not in {None,''} else 0
-                        trading=int(r.get('tradestatus') or 0)
-                        if volume<0 or (trading and change is None):continue
-                        values.append((r['code'],r['date'],change,volume,trading))
-                    except (ValueError,TypeError):continue
-                db.executemany('INSERT OR REPLACE INTO breadth VALUES(?,?,?,?,?)',values)
-            _,still_missing=self.store.history_gaps(start,end)
+                if fallback['ok']:self.save_breadth(fallback['data']['records'],[code],start,end)
+            if retrying:_,still_missing=self.store.history_gaps(start,end)
             errors={r['symbol']:r['error'] for r in data['errors']}
             for code in batch:
                 key=retry_key(code)

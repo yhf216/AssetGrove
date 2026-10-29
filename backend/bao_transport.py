@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import socket
+import re
 import time
 import zlib
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ class Transport:
         return BaoTransportError(f'BaoStock {stage}失败 [{self.host}:{self.port}]：{detail}；{exc}')
 
     def connect(self):
+        self.close()
         try:
             self.connection = socket.create_connection((self.host, self.port), timeout=self.timeout)
         except OSError as exc:
@@ -31,6 +33,8 @@ class Transport:
 
     def exchange(self, message):
         from baostock.common import contants as constants
+        if self.connection is None:
+            raise BaoTransportError('BaoStock 连接已关闭，需重新登录后重试')
         deadline = time.monotonic() + self.timeout
         stage = '发送'
         try:
@@ -39,7 +43,10 @@ class Transport:
             stage = '接收'
             marker = b'<![CDATA[]]>\n'
             received = self.pending
-            while marker not in received:
+            self.pending = b''
+            limit = 16*1024*1024
+            def receive():
+                nonlocal received
                 remaining = deadline-time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError('响应超过时限')
@@ -48,26 +55,44 @@ class Transport:
                 if not chunk:
                     raise ConnectionError(f'服务器提前断开连接，已接收 {len(received)} 字节')
                 received += chunk
-                if len(received) > 16*1024*1024:
+                if len(received) > limit+constants.MESSAGE_HEADER_LENGTH+8192:
                     raise ValueError('响应超过 16 MiB 上限')
-            end = received.index(marker)+len(marker)
-            frame, self.pending = received[:end], received[end:]
+            while len(received)<constants.MESSAGE_HEADER_LENGTH:receive()
             stage = '解析响应'
-            header = frame[:constants.MESSAGE_HEADER_LENGTH].decode('utf-8')
+            raw_header=received[:constants.MESSAGE_HEADER_LENGTH]
+            if not re.fullmatch(rb'[0-9.]{7}\x01[0-9]{2}\x01[0-9]{10}',raw_header):
+                raise ValueError('报文头无效，连接已丢弃，等待重新登录')
+            header = raw_header.decode('ascii')
             fields = header.split(constants.MESSAGE_SPLIT)
-            if fields[1] in constants.COMPRESSED_MESSAGE_TYPE_TUPLE:
-                size = int(fields[2])
-                body = frame[constants.MESSAGE_HEADER_LENGTH:constants.MESSAGE_HEADER_LENGTH+size]
-                if size < 0 or len(body) != size:
-                    raise ValueError('响应长度不完整')
-                return header+zlib.decompress(body).decode('utf-8')
+            size=int(fields[2])
+            if size>limit:raise ValueError('声明的响应长度超过 16 MiB 上限')
+            compressed=fields[1] in constants.COMPRESSED_MESSAGE_TYPE_TUPLE
+            # Compressed payload is binary: its contents cannot delimit a frame.
+            boundary=constants.MESSAGE_HEADER_LENGTH+size if compressed else constants.MESSAGE_HEADER_LENGTH
+            stage = '接收'
+            while len(received)<boundary or received.find(marker,boundary)<0:
+                if compressed and len(received)>boundary+128:raise ValueError('响应结束标记异常')
+                receive()
+            end=received.index(marker,boundary)+len(marker)
+            frame,self.pending=received[:end],received[end:]
+            stage = '解析响应'
+            if compressed:
+                body=frame[constants.MESSAGE_HEADER_LENGTH:boundary]
+                decoded=zlib.decompress(body)
+                if len(decoded)>limit:raise ValueError('解压后的响应超过 16 MiB 上限')
+                return header+decoded.decode('utf-8')
             return frame.decode('utf-8')
         except (OSError, ValueError, IndexError, zlib.error) as exc:
+            # An incomplete reply may arrive later. Never send another query on it.
+            self.close()
             raise self.error(stage, exc) from exc
 
     def close(self):
-        if self.connection is not None:
-            self.connection.close()
+        connection,self.connection=self.connection,None
+        self.pending=b''
+        if connection is not None:
+            try:connection.close()
+            except OSError:pass
 
 
 @contextmanager
@@ -80,6 +105,7 @@ def safe_baostock_transport():
 
     def connect(_self, api_key):
         nonlocal transport
+        if transport:transport.close()
         host = contants.BAOSTOCK_VIP_SERVER_IP if api_key.startswith('bs-') else contants.BAOSTOCK_SERVER_IP
         transport = Transport(host, contants.BAOSTOCK_SERVER_PORT)
         context.default_socket = transport.connect()
