@@ -57,7 +57,7 @@ def paced_http(budget=None):
 
 
 def query(action,payload):
-    budget=MarketBudget(payload['_market_cache'],payload.get('_market_scope','history')) if payload.get('_market_cache') else None
+    budget=MarketBudget(payload['_market_cache'],payload.get('_market_scope','history'),payload.get('_market_manual',False)) if payload.get('_market_cache') else None
     with paced_http(budget):return _query(action,payload,budget)
 
 
@@ -106,40 +106,19 @@ def _query(action, payload, budget=None):
         bars = [{**r,'date':str(r['date'])[:10]} for r in _records(frame) if start <= str(r['date'])[:10] <= end]
         return {'source':source,'volume_unit':'手' if action == 'market_index_em' else '股','bars':bars}
     if action == 'market_snapshot':
-        import akshare as ak
-        errors=[]
-        for fetch,source,multiplier in [(ak.stock_zh_a_spot_em,'AKShare / 东方财富',100),(ak.stock_zh_a_spot,'AKShare / 新浪财经',1)]:
-            try:
-                frame=fetch()
-                records=[]
-                for r in _records(frame):
-                    code=str(r['代码']).lower().replace('sh','').replace('sz','')
-                    if not re.fullmatch(r'(60|68|00|30)\d{4}',code):
-                        continue
-                    change=r.get('涨跌幅')
-                    price=r.get('最新价')
-                    volume=r.get('成交量')
-                    valid = price is not None and volume is not None and change is not None and float(price)>0
-                    records.append({'symbol':code,'change':str(change) if valid else None,'volume':str(Decimal(str(volume))*multiplier) if valid else None,'time':str(r.get('时间戳',''))})
-                if len(records)<3000:
-                    raise ValueError('全市场有效行数不足，未发布 TRIN')
-                # 全市场快照没有日期字段；读取沪深锚点源日期，避免周末把昨日行情记作今日。
-                import requests
-                response=requests.get('https://hq.sinajs.cn/list=sh000001,sz399001',headers={'Referer':'https://finance.sina.com.cn/'},timeout=12)
-                response.encoding='gb18030'
-                dates=[]
-                for line in response.text.splitlines():
-                    values=line.split('="',1)[-1].split('"',1)[0].split(',')
-                    if len(values)>=32:dates.append(values[30])
-                if len(dates)!=2 or len(set(dates))!=1 or dates[0]>now().date().isoformat():
-                    raise ValueError('无法核实沪深快照源日期')
-                return {'source':source,'date':dates[0],'received_at':now().isoformat(),'provisional':dates[0]==now().date().isoformat() and now().strftime('%H:%M')<'15:10','stocks':records}
-            except MarketLimit as exc:
-                if not exc.source:raise
-                errors.append(str(exc))
-            except Exception as exc:
-                errors.append(str(exc)[:150])
-        raise ValueError('；'.join(errors))
+        from .quote_batch import read_quotes
+        symbols=payload.get('symbols',[])
+        if len(set(symbols))<3000:raise ValueError('证券目录不完整，保留已缓存的 TRIN')
+        quotes=read_quotes(['sh000001','sz399001',*symbols])
+        anchors=[quotes.get(code) for code in ['sh000001','sz399001']]
+        if not all(anchors) or anchors[0]['date']!=anchors[1]['date']:raise ValueError('无法核实沪深快照日期')
+        day=anchors[0]['date']
+        records=[]
+        for code in symbols:
+            quote=quotes.get(code)
+            if not quote or not quote['timestamp_verified'] or quote['date']!=day:raise ValueError('批量快照样本未齐，保留已缓存的 TRIN')
+            records.append({'symbol':code,'change':quote['change'],'volume':quote['volume'],'trading':int(Decimal(quote['price'])>0)})
+        return {'source':'新浪财经 / 批量行情','date':day,'received_at':now().isoformat(),'provisional':day==now().date().isoformat() and now().strftime('%H:%M')<'15:10','stocks':records}
     if action in {'market_universe','market_breadth_batch','market_calendar'}:
         import baostock as bs
         def consume(result):

@@ -6,10 +6,11 @@ import time
 
 from .storage import now
 
-INTERVAL = 5.0
-DAILY_LIMIT = 600
-HOURLY_LIMIT = 120
-HISTORY_DAILY_LIMIT = 450  # Leave room for the daily index/snapshot refresh.
+INTERVAL = 30.0
+DAILY_LIMIT = 60
+AUTOMATIC_DAILY_LIMIT = 40
+HOURLY_LIMIT = 20
+HISTORY_DAILY_LIMIT = 10
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS market_requests(at REAL NOT NULL,scope TEXT NOT NULL,source TEXT NOT NULL);
@@ -24,7 +25,8 @@ class MarketLimit(RuntimeError):
 
 
 class MarketBudget:
-    def __init__(self,path,scope='history'):
+    def __init__(self,path,scope='history',manual=False):
+        if manual:scope='manual:'+scope
         self.path=path;self.scope=scope
         with self.connect() as db:db.executescript(SCHEMA)
 
@@ -45,8 +47,8 @@ class MarketBudget:
                 db.execute('DELETE FROM market_requests WHERE at<?',(stamp-172800,))
                 circuit=db.execute('SELECT until FROM market_circuits WHERE source=?',(source,)).fetchone()
                 if circuit and circuit[0]>stamp:raise MarketLimit('数据源冷却中，稍后自动继续',circuit[0],source)
-                daily,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight.timestamp(),)).fetchone()
-                if daily>=DAILY_LIMIT or (self.scope=='history' and history>=HISTORY_DAILY_LIMIT):
+                daily,automatic,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope NOT LIKE 'manual:%'),0),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight.timestamp(),)).fetchone()
+                if daily>=DAILY_LIMIT or (not self.scope.startswith('manual:') and automatic>=AUTOMATIC_DAILY_LIMIT) or (self.scope=='history' and history>=HISTORY_DAILY_LIMIT):
                     raise MarketLimit('已达今日市场请求预算，明日自动继续',tomorrow)
                 count,first,last=db.execute('SELECT COUNT(*),MIN(at),MAX(at) FROM market_requests WHERE at>?',(stamp-3600,)).fetchone()
                 if count>=HOURLY_LIMIT:raise MarketLimit('已达每小时市场请求预算，稍后自动继续',first+3600.01)
@@ -71,5 +73,5 @@ class MarketBudget:
     def status(self):
         moment=now();midnight=moment.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
         with self.connect() as db:
-            used,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight,)).fetchone()
-        return {'used':used,'limit':DAILY_LIMIT,'history_used':history,'history_limit':HISTORY_DAILY_LIMIT,'hourly_limit':HOURLY_LIMIT,'interval':INTERVAL}
+            used,automatic,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope NOT LIKE 'manual:%'),0),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight,)).fetchone()
+        return {'used':used,'limit':DAILY_LIMIT,'automatic_used':automatic,'automatic_limit':AUTOMATIC_DAILY_LIMIT,'history_used':history,'history_limit':HISTORY_DAILY_LIMIT,'hourly_limit':HOURLY_LIMIT,'interval':INTERVAL}

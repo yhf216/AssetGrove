@@ -12,7 +12,8 @@ import threading
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date,timedelta
+from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,9 @@ from .storage import Database, audit, now, rows
 from .network import configure_direct_network
 from .settings import read_settings, write_settings, app_directory
 from .market import MarketStore, MarketService
+from .market_network import MarketBudget,MarketLimit
+from .sync_schedule import automatic_slot
+from .quote_batch import BATCH_SIZE
 
 BACKUP_TABLES = ['meta','accounts','securities','transactions','watchlist','quotes','daily_prices','dividends','entitlements','rules','notifications','cashflows','flow_runs']
 
@@ -40,8 +44,10 @@ def emit(message):
         sys.stdout.flush()
 
 class Service:
-    def __init__(self,database):
+    def __init__(self,database,network_path=None):
         self.db = database
+        self.network_path=str(network_path or database.path.parent/'market.sqlite3')
+        self.network=MarketBudget(self.network_path,'daily')
         self.busy = threading.Lock()
         self.stop = threading.Event()
         self.last_quotes = 0.0
@@ -56,41 +62,81 @@ class Service:
         with self.db.connect() as db:
             self.opening_rules = {r['id'] for r in rows(db,'SELECT id FROM rules WHERE enabled=1')}
             evaluate_rules(db,emit,self.opening_rules)
-            tracked = db.execute("SELECT 1 FROM rules WHERE enabled=1 LIMIT 1").fetchone()
-        if tracked:
-            self.sync()
 
-    def sync(self, full=False, symbols=None):
+    def sync(self, full=False, symbols=None, manual=True, automatic=None):
         if not self.busy.acquire(blocking=False):
+            if not manual:return False
             with self.queue_lock:
                 self.queued_symbols.update(symbols or [])
                 self.queued_all |= symbols is None
                 self.queued_full |= full
             return False
+        if automatic:
+            with self.db.connect() as db:status(db,'automatic_slot',automatic)
         def work():
             try:
                 with self.db.connect() as db:
                     status(db,'running','1')
                     tracked = symbols if symbols is not None else [r['symbol'] for r in rows(db,"SELECT symbol FROM watchlist UNION SELECT symbol FROM rules WHERE enabled=1 UNION SELECT DISTINCT symbol FROM transactions WHERE symbol<>''")]
-                actions = [('ak_quote',symbol) for symbol in tracked]
-                actions.append(('bao_calendar',tracked[0] if tracked else '600036'))
-                for symbol in tracked:
-                    if full:
-                        actions.extend((action,symbol) for action in (['ak_etf_history','ak_etf_dividends'] if is_etf(symbol) else ['bao_history','bao_dividends','ak_dividends']))
+                    today=now().date().isoformat()
+                    cached={r['key']:r['value'] for r in rows(db,"SELECT key,value FROM sync_status WHERE key LIKE 'cache:%'")}
+                    latest={r['symbol']:r['day'] for r in rows(db,'SELECT symbol,MAX(date) day FROM daily_prices GROUP BY symbol')}
+                    price_dates={}
+                    for record in rows(db,'SELECT symbol,date FROM daily_prices'):price_dates.setdefault(record['symbol'],set()).add(record['date'])
+                    calendar={r['key'][12:]:int(r['value']) for r in rows(db,"SELECT key,value FROM sync_status WHERE key LIKE 'trading_day:%'")}
+                def request(action,payload,timeout=90):
+                    response=fetch(action,{**payload,'_market_cache':self.network_path,'_market_manual':manual},timeout=timeout,cancel=self.stop)
+                    if response.get('limited'):raise MarketLimit(response['error'],response['retry_at'],response.get('source',''))
+                    return response
+                for offset in range(0,len(tracked),BATCH_SIZE):
+                    if self.stop.is_set():return
+                    batch=tracked[offset:offset+BATCH_SIZE]
+                    result=request('quote_batch',{'symbols':[('sh' if s.startswith(('5','6')) else 'sz')+s for s in batch]})
+                    with self.db.connect() as db:
+                        if result['ok']:
+                            for quote in result['data']:
+                                if Decimal(quote['price'])<=0:continue
+                                apply_result(db,'ak_quote',quote['symbol'],{'ok':True,'data':quote})
+                                if quote['timestamp_verified'] and quote['as_of'][11:16]>='15:00':
+                                    db.execute('INSERT OR REPLACE INTO daily_prices VALUES(?,?,?,?)',(quote['symbol'],quote['as_of'][:10],quote['price'],quote['source']))
+                        else:status(db,'quote_batch','失败 · '+result.get('error','批量报价失败'))
+                        evaluate_rules(db,emit,self.opening_rules)
+                actions=[]
+                history_starts={}
+                if cached.get('cache:calendar','')<str(now().date()-timedelta(days=5)):
+                    actions.append(('bao_calendar',tracked[0] if tracked else '600036'))
+                for symbol in tracked if full else []:
+                    history='ak_etf_history' if is_etf(symbol) else 'bao_history'
+                    last=date.fromisoformat(latest[symbol]) if symbol in latest else None
+                    day=last+timedelta(days=1) if last else now().date()-timedelta(days=365)
+                    gap=last is None
+                    known_holes=[value for value,trading in calendar.items() if trading and value<today and value not in price_dates.get(symbol,set()) and value>=min(price_dates.get(symbol,{today}))]
+                    if known_holes:gap=True;history_starts[symbol]=min(known_holes)
+                    while not gap and day<now().date():
+                        gap=calendar.get(day.isoformat(),int(day.weekday()<5))==1
+                        day+=timedelta(days=1)
+                    if gap and cached.get('cache:'+history+':'+symbol)!=today:actions.append((history,symbol))
+                    dividend='ak_etf_dividends' if is_etf(symbol) else 'ak_dividends'
+                    if cached.get('cache:'+dividend+':'+symbol)!=today:actions.append((dividend,symbol))
                 for action,symbol in actions:
                     if self.stop.is_set():
                         break
-                    result = fetch(action,{'symbol':symbol},cancel=self.stop)
+                    payload={'symbol':symbol}
+                    if action in {'bao_history','ak_etf_history'} and latest.get(symbol):payload['start']=history_starts.get(symbol,str(date.fromisoformat(latest[symbol])+timedelta(days=1)))
+                    result = request(action,payload,timeout=180)
                     if action == 'bao_calendar' and not result['ok']:
                         with self.db.connect() as db:
                             apply_result(db,action,symbol,result)
-                        action, result = 'ak_calendar', fetch('ak_calendar', {'symbol':symbol},cancel=self.stop)
+                        action, result = 'ak_calendar', request('ak_calendar', {'symbol':symbol})
                     with self.db.connect() as db:
                         apply_result(db,action,symbol,result)
+                        if result['ok']:status(db,'cache:calendar' if action in {'bao_calendar','ak_calendar'} else 'cache:'+action+':'+symbol,today)
                         evaluate_rules(db,emit,self.opening_rules)
                 self.last_quotes = time.monotonic()
                 if full and symbols is None:
                     self.last_full = now().date().isoformat()
+            except MarketLimit as exc:
+                with self.db.connect() as db:status(db,'error',str(exc))
             except Exception as exc:
                 with self.db.connect() as db:
                     status(db,'error',str(exc)[:300])
@@ -108,22 +154,21 @@ class Service:
         threading.Thread(target=work,daemon=True).start()
         return True
 
+    def tick(self,moment=None):
+        moment=moment or now()
+        with self.db.connect() as db:
+            status(db,'scheduler_last_tick',moment.isoformat())
+            run_cashflows(db);build_state(db)
+            tracked=db.execute("SELECT 1 FROM watchlist UNION SELECT 1 FROM rules WHERE enabled=1 UNION SELECT 1 FROM transactions WHERE symbol<>'' LIMIT 1").fetchone()
+            evaluate_rules(db,emit,self.opening_rules)
+            trading=db.execute('SELECT value FROM sync_status WHERE key=?',('trading_day:'+moment.date().isoformat(),)).fetchone()
+            previous=db.execute("SELECT value FROM sync_status WHERE key='automatic_slot'").fetchone()
+        slot=automatic_slot(moment,int(trading[0]) if trading else None)
+        if tracked and slot and (not previous or previous[0]!=slot):self.sync(full=True,manual=False,automatic=slot)
+
     def loop(self):
         while not self.stop.wait(15):
-            try:
-                with self.db.connect() as db:
-                    status(db,'scheduler_last_tick',now().isoformat())
-                    run_cashflows(db)
-                    build_state(db)  # 派息日生成待确认到账，不自动增加现金。
-                    tracked = db.execute('SELECT 1 FROM watchlist UNION SELECT 1 FROM rules WHERE enabled=1 UNION SELECT 1 FROM transactions WHERE symbol<>\'\' LIMIT 1').fetchone()
-                    evaluate_rules(db, emit, self.opening_rules)
-                if tracked:
-                    moment = now()
-                    market = moment.weekday() < 5 and ('09:30'<=moment.strftime('%H:%M')<='11:30' or '13:00'<=moment.strftime('%H:%M')<='15:00')
-                    if self.last_full != moment.date().isoformat():
-                        self.sync(full=True)
-                    elif market and time.monotonic()-self.last_quotes >= 600:
-                        self.sync()
+            try:self.tick()
             except Exception as exc:
                 with self.db.connect() as db:
                     status(db,'scheduler_error',str(exc)[:300])
@@ -132,9 +177,9 @@ def create_app(database=None, token=None, background=True):
     injected_database = database is not None
     database = database or Database()
     token = token or secrets.token_urlsafe(32)
-    service = Service(database)
     market_base = database.path.parent if injected_database else Path(os.getenv('ASSETGROVE_DATA_DIR') or app_directory()/'data')
     market = MarketService(MarketStore(market_base/'market.sqlite3'))
+    service = Service(database,market.store.path)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -271,8 +316,6 @@ def create_app(database=None, token=None, background=True):
         with database.connect() as db:
             db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO NOTHING', (symbol, security_name(db,symbol,body.get('name',''))))
             result = security_snapshot(db,symbol)
-        if background:
-            service.sync(True,[symbol])
         return result
 
     @app.get('/api/security/{symbol}',dependencies=[Depends(auth)])
@@ -299,25 +342,18 @@ def create_app(database=None, token=None, background=True):
     def transactions(body:dict):
         with database.connect() as db:
             tid = save_transaction(db,body)
-        if body.get('kind') in {'buy','sell','opening_position'} and background:
-            service.sync(True,[symbol_code(body.get('symbol',''))])
         return {'id':tid}
 
     @app.put('/api/transactions/{tx_id}',dependencies=[Depends(auth)])
     def edit_transaction(tx_id:str,body:dict):
         with database.connect() as db:
             tid = save_transaction(db,body,tx_id)
-        if body.get('kind') in {'buy','sell','opening_position'} and background:
-            service.sync(True,[symbol_code(body.get('symbol',''))])
         return {'id':tid}
 
     @app.delete('/api/transactions/{tx_id}',dependencies=[Depends(auth)])
     def remove_transaction(tx_id:str):
         with database.connect() as db:
-            old = db.execute('SELECT symbol FROM transactions WHERE id=?',(tx_id,)).fetchone()
             delete_transaction(db,tx_id)
-        if old and old['symbol'] and background:
-            service.sync(True,[old['symbol']])
         return {'ok':True}
 
     @app.post('/api/watchlist',dependencies=[Depends(auth)])
@@ -326,8 +362,6 @@ def create_app(database=None, token=None, background=True):
         with database.connect() as db:
             db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO UPDATE SET name=excluded.name',(symbol,security_name(db,symbol,body.get('name',''))))
             db.execute('INSERT OR IGNORE INTO watchlist VALUES(?)',(symbol,))
-        if background:
-            service.sync(True,[symbol])
         return {'ok':True}
 
     @app.delete('/api/watchlist/{symbol}',dependencies=[Depends(auth)])
@@ -372,8 +406,6 @@ def create_app(database=None, token=None, background=True):
                 db.execute('INSERT INTO rules VALUES(?,?,?,?,?,?,1,0)',(rid,symbol,price,yield_value,basis,mode))
             audit(db,'update' if before else 'create','rule:'+rid,dict(before) if before else None,body)
             evaluate_rules(db, emit, {rid})
-        if background:
-            service.sync(True,[symbol])
         return {'ok':True,'id':rid}
 
     @app.post('/api/rules',dependencies=[Depends(auth)])

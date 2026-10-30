@@ -35,22 +35,27 @@ def _worker(pipe, action, payload):
     try:
         pipe.send({'progress': '初始化网络组件'})
         configure_direct_network()
+        from .market_network import MarketBudget
+        from .market_sources import paced_http
+        budget=MarketBudget(payload['_market_cache'],'daily',payload.get('_market_manual',False)) if payload.get('_market_cache') and not action.startswith('market_') else None
         pipe.send({'progress': '查询供应商'})
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), paced_http(budget) if budget else contextlib.nullcontext():
             try:
                 if action.startswith('bao_'):
-                    for attempt in range(2):
+                    for attempt in range(1 if budget else 2):
                         try:
-                            with safe_baostock_transport():
+                            transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error)) if budget else safe_baostock_transport()
+                            with transport:
                                 result = _fetch(action, payload)
                             break
                         except BaoTransportError:
-                            if attempt == 1:
+                            if budget or attempt == 1:
                                 raise
                             pipe.send({'progress': '重新连接 BaoStock'})
                             time.sleep(0.4)
                 else:
                     result = _fetch(action, payload)
+            except MarketLimit:raise
             except Exception as primary_error:
                 fallbacks = {'ak_quote':['ak_quote_sina','ak_quote_xq'], 'ak_etf_history':['ak_etf_history_sina'], 'ak_etf_dividends':['ak_etf_dividends_sina']}.get(action)
                 if not fallbacks:
@@ -60,6 +65,7 @@ def _worker(pipe, action, payload):
                     try:
                         result = _fetch(fallback,payload)
                         break
+                    except MarketLimit:raise
                     except Exception as exc:
                         errors.append(f'{fallback}：{str(exc)[:100]}')
                 else:
@@ -184,6 +190,9 @@ def _fetch(action, payload):
     if action.startswith('market_'):
         from .market_sources import query
         return query(action,payload)
+    if action=='quote_batch':
+        from .quote_batch import read_quotes
+        return list(read_quotes(payload['symbols']).values())
     symbol = payload.get('symbol', '600036')
     code = market_prefix(symbol) + '.' + symbol
     if action.startswith('bao_'):
@@ -207,7 +216,7 @@ def _fetch(action, payload):
                 return consume(bs.query_history_k_data_plus(code, 'date,time,code,close', start_date=now().date().isoformat(), end_date=now().date().isoformat(), frequency='5', adjustflag='3'))
             if action == 'bao_dividends':
                 result = []
-                for year in range(now().year-5, now().year+1):
+                for year in payload.get('years',range(now().year-5, now().year+1)):
                     result.extend(consume(bs.query_dividend_data(code, str(year), yearType='operate')))
                 return result
             if action == 'bao_calendar':
@@ -225,13 +234,13 @@ def _fetch(action, payload):
     if action == 'ak_calendar':
         return ak.tool_trade_date_hist_sina().astype(str).to_dict('records')
     if action == 'ak_etf_history':
-        frame = ak.fund_etf_hist_em(symbol=symbol, start_date=(now().date()-timedelta(days=365)).strftime('%Y%m%d'), end_date=now().strftime('%Y%m%d'), adjust='')
+        frame = ak.fund_etf_hist_em(symbol=symbol, start_date=payload.get('start',(now().date()-timedelta(days=365)).isoformat()).replace('-',''), end_date=now().strftime('%Y%m%d'), adjust='')
         if frame.empty:
             raise ValueError('东方财富 ETF 历史行情为空')
         return frame.astype(object).where(frame.notna(),None).to_dict('records')
     if action == 'ak_etf_history_sina':
         frame = ak.fund_etf_hist_sina(symbol=market_prefix(symbol)+symbol)
-        cutoff = (now().date()-timedelta(days=365)).isoformat()
+        cutoff = payload.get('start',(now().date()-timedelta(days=365)).isoformat())
         return [{'日期':clean_date(r['date']),'收盘':str(r['close']),'_source':'AKShare / 新浪财经 ETF'} for r in frame.to_dict('records') if clean_date(r['date']) >= cutoff]
     if action == 'ak_etf_dividends':
         frame = ak.fund_open_fund_info_em(symbol=symbol,indicator='分红送配详情')
@@ -403,6 +412,11 @@ def usable_rule_quote(db, quote, moment, opening=False):
     intraday = trading and trading[0] == '1' and ('09:30' <= hm <= '11:30' or '13:00' <= hm <= '15:00')
     if intraday:
         return age <= 900
+    if trading and trading[0]=='1' and stamp.date()==moment.date():
+        # Twice-daily syncing uses verified lunch/closing snapshots, rather than
+        # fetching another price merely to satisfy the former 15-minute clock.
+        if '11:30'<hm<'13:00' and stamp.strftime('%H:%M')>='11:15':return True
+        if hm>'15:00' and stamp.strftime('%H:%M')>='14:45':return True
     if not opening:
         return False
     if not trading:

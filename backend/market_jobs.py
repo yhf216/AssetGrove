@@ -3,11 +3,12 @@ from datetime import date, timedelta
 import threading
 
 from .storage import now
+from .sync_schedule import automatic_slot,TIMES
 
 
 def last_closed_day(store,moment=None):
     moment=moment or now()
-    day=moment.date() if moment.strftime('%H:%M')>='18:00' else moment.date()-timedelta(days=1)
+    day=moment.date() if moment.strftime('%H:%M')>=TIMES[-1] else moment.date()-timedelta(days=1)
     with store.connect() as db:
         calendar={r['date']:r['trading'] for r in db.execute('SELECT date,trading FROM calendar WHERE date BETWEEN ? AND ?',(str(day-timedelta(days=20)),str(day)))}
     while day.weekday()>=5 or calendar.get(str(day))==0:day-=timedelta(days=1)
@@ -54,13 +55,20 @@ class MarketScheduler:
     def tick(self,moment=None):
         moment=moment or now()
         if self.service.state()['progress']['running']:return
-        target=last_closed_day(self.store,moment)
-        retry=self.store.setting('daily_retry_at',default=0)
-        if self.store.setting('daily_attempt')!=target or (retry and moment.timestamp()>=retry and self.store.setting('daily_success')!=target):
-            self.service.start('indices',daily_target=target)
+        today=moment.date().isoformat()
+        with self.store.connect() as db:trading=db.execute('SELECT trading FROM calendar WHERE date=?',(today,)).fetchone()
+        slot=automatic_slot(moment,trading[0] if trading else None)
+        if not slot:return
+        if self.store.setting('market_auto_attempt')!=slot:
+            self.service.start('indices',daily_target=today,automatic=slot)
             return
         if not self.store.setting('history_enabled',default=True):return
-        if moment.timestamp()<self.store.setting('history_next_at',default=0):return
+        # A single small history batch after the closing update. No automatic
+        # retry loops, including after restarts, pause/resume or old retry timers.
+        if not slot.endswith(TIMES[-1]) or self.store.setting('history_auto_attempt')==today:return
+        if self.store.setting('market_auto_completed')!=slot:return
+        self.store.setting('history_auto_attempt',today,write=True)
+        target=last_closed_day(self.store,moment)
         plan=self.store.setting('history_plan')
         if not plan:
             with self.store.connect() as db:
@@ -69,7 +77,7 @@ class MarketScheduler:
             start=bounds[0] if bounds[0] and bounds[0]<=end else str(date.fromisoformat(end)-timedelta(days=120))
             plan={'start':start,'end':end}
             self.store.setting('history_plan',plan,write=True)
-        self.service.start('history',plan['start'],plan['end'],budget=75,managed=True)
+        self.service.start('history',plan['start'],plan['end'],budget=0,managed=True)
 
     def completed(self,start,end,result):
         if not result:return
