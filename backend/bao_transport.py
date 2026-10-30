@@ -102,18 +102,27 @@ def safe_baostock_transport(before_request=None, outcome=None):
     from baostock.common import context, contants
     original_connect, original_send = socketutil.SocketUtil.connect, socketutil.send_msg
     transport = None
+    first_reserved = False
 
     def connect(_self, api_key):
-        nonlocal transport
+        nonlocal transport, first_reserved
         if transport:transport.close()
+        # Reserve the login before opening TCP, so an exhausted budget does not
+        # turn repeated manual syncs into repeated connection attempts.
+        if before_request:before_request();first_reserved=True
         host = contants.BAOSTOCK_VIP_SERVER_IP if api_key.startswith('bs-') else contants.BAOSTOCK_SERVER_IP
         transport = Transport(host, contants.BAOSTOCK_SERVER_PORT)
-        context.default_socket = transport.connect()
+        try:context.default_socket = transport.connect()
+        except BaoTransportError as exc:
+            if outcome:outcome(exc)
+            raise
 
     def send(message):
+        nonlocal first_reserved
         if transport is None or transport.connection is None:
             raise BaoTransportError('BaoStock 尚未建立连接')
-        if before_request:before_request()
+        if first_reserved:first_reserved=False
+        elif before_request:before_request()
         try:
             result=transport.exchange(message)
         except BaoTransportError as exc:
