@@ -19,6 +19,7 @@ from .storage import TZ, now, rows
 from .ledger import cents, decimal, dps_for, uid, market_prefix, security_name
 from .network import configure_direct_network
 from .bao_transport import BaoTransportError, safe_baostock_transport
+from .market_network import MarketLimit
 
 def clean_date(value):
     value = str(value)
@@ -65,6 +66,8 @@ def _worker(pipe, action, payload):
                     raise RuntimeError('；'.join(errors)) from primary_error
                 pipe.send({'progress':'备用源查询成功'})
         pipe.send({'ok': True, 'data': result})
+    except MarketLimit as exc:
+        pipe.send({'ok':False,'limited':True,'retry_at':exc.retry_at,'source':exc.source,'error':str(exc)})
     except BaseException as exc:
         pipe.send({'ok': False, 'error': f'{type(exc).__name__}: {str(exc)[:240]}'})
     finally:

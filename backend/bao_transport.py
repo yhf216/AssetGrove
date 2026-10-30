@@ -96,7 +96,7 @@ class Transport:
 
 
 @contextmanager
-def safe_baostock_transport():
+def safe_baostock_transport(before_request=None, outcome=None):
     # Only the isolated provider worker is patched, never site-packages or other apps.
     from baostock.util import socketutil
     from baostock.common import context, contants
@@ -113,7 +113,14 @@ def safe_baostock_transport():
     def send(message):
         if transport is None or transport.connection is None:
             raise BaoTransportError('BaoStock 尚未建立连接')
-        return transport.exchange(message)
+        if before_request:before_request()
+        try:
+            result=transport.exchange(message)
+        except BaoTransportError as exc:
+            if outcome:outcome(exc)
+            raise
+        if outcome:outcome(None)
+        return result
 
     socketutil.SocketUtil.connect, socketutil.send_msg = connect, send
     try:

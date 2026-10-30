@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from .storage import now
 from .bao_transport import BaoTransportError, safe_baostock_transport
+from .market_network import MarketBudget, MarketLimit
 
 
 def _records(frame):
@@ -14,26 +15,53 @@ def _records(frame):
 
 
 @contextmanager
-def paced_http():
+def paced_http(budget=None):
     """Throttle paginated SDK requests inside this disposable market worker only."""
     import requests
     original=requests.sessions.Session.request
+    original_send=requests.sessions.Session.send
     last=0.0
     def request(session,*args,**kwargs):
         nonlocal last
         time.sleep(max(0,1.0-(time.monotonic()-last)))
         last=time.monotonic()
         return original(session,*args,**kwargs)
-    requests.sessions.Session.request=request
+    def send(session,prepared,**kwargs):
+        from urllib.parse import urlsplit
+        host=(urlsplit(prepared.url).hostname or '').lower()
+        source='eastmoney' if 'eastmoney.com' in host else 'sina' if 'sina' in host else host
+        budget.reserve(source)
+        try:
+            response=original_send(session,prepared,**kwargs)
+        except MarketLimit:raise
+        except Exception as exc:
+            budget.outcome(source,exc);raise
+        if response.status_code in {403,429}:
+            from email.utils import parsedate_to_datetime
+            retry=response.headers.get('Retry-After','0')
+            try:retry=float(retry)
+            except ValueError:
+                try:retry=max(0,parsedate_to_datetime(retry).timestamp()-now().timestamp())
+                except (ValueError,TypeError,OverflowError):retry=0
+            budget.outcome(source,'HTTP '+str(response.status_code),blocked=True,retry_after=retry)
+            response.close()
+            raise MarketLimit('数据源拒绝或限制访问，暂停该源至少 24 小时',now().timestamp()+max(86400,retry),source)
+        budget.outcome(source,None if response.status_code<500 else 'HTTP '+str(response.status_code))
+        return response
+    if budget:requests.sessions.Session.send=send
+    else:requests.sessions.Session.request=request
     try:yield
-    finally:requests.sessions.Session.request=original
+    finally:
+        requests.sessions.Session.request=original
+        requests.sessions.Session.send=original_send
 
 
 def query(action,payload):
-    with paced_http():return _query(action,payload)
+    budget=MarketBudget(payload['_market_cache'],payload.get('_market_scope','history')) if payload.get('_market_cache') else None
+    with paced_http(budget):return _query(action,payload,budget)
 
 
-def _query(action, payload):
+def _query(action, payload, budget=None):
     if action=='market_universe_ak':
         import akshare as ak
         result={}
@@ -106,6 +134,9 @@ def _query(action, payload):
                 if len(dates)!=2 or len(set(dates))!=1 or dates[0]>now().date().isoformat():
                     raise ValueError('无法核实沪深快照源日期')
                 return {'source':source,'date':dates[0],'received_at':now().isoformat(),'provisional':dates[0]==now().date().isoformat() and now().strftime('%H:%M')<'15:10','stocks':records}
+            except MarketLimit as exc:
+                if not exc.source:raise
+                errors.append(str(exc))
             except Exception as exc:
                 errors.append(str(exc)[:150])
         raise ValueError('；'.join(errors))
@@ -119,7 +150,8 @@ def _query(action, payload):
                 values.append(dict(zip(result.fields,result.get_row_data())))
             if result.error_code!='0':raise ValueError(result.error_msg or '历史分页查询失败')
             return values
-        with safe_baostock_transport():
+        transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error)) if budget else safe_baostock_transport()
+        with transport:
             login=bs.login()
             if login.error_code!='0':
                 raise ValueError(login.error_msg)
@@ -135,6 +167,8 @@ def _query(action, payload):
                         values=consume(bs.query_history_k_data_plus(code,'date,code,close,preclose,volume,pctChg,tradestatus',start_date=payload['start'],end_date=payload['end'],frequency='d',adjustflag='3'))
                         if not values:raise ValueError('历史响应为空，保留缺口等待重试')
                         records.extend(values);completed.append(code)
+                    except MarketLimit as exc:
+                        return {'records':records,'completed':completed,'errors':errors,'limited':True,'retry_at':exc.retry_at,'source':exc.source,'error':str(exc)}
                     except BaoTransportError as exc:
                         errors.append({'symbol':code,'error':str(exc)[:160]})
                         errors.extend({'symbol':s,'error':'BaoStock 连接已中断，已保留缺口，稍后重新连接'} for s in payload['symbols'][index+1:])

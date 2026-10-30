@@ -55,7 +55,8 @@ class MarketScheduler:
         moment=moment or now()
         if self.service.state()['progress']['running']:return
         target=last_closed_day(self.store,moment)
-        if self.store.setting('daily_attempt')!=target:
+        retry=self.store.setting('daily_retry_at',default=0)
+        if self.store.setting('daily_attempt')!=target or (retry and moment.timestamp()>=retry and self.store.setting('daily_success')!=target):
             self.service.start('indices',daily_target=target)
             return
         if not self.store.setting('history_enabled',default=True):return
