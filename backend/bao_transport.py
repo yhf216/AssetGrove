@@ -96,7 +96,7 @@ class Transport:
 
 
 @contextmanager
-def safe_baostock_transport(before_request=None, outcome=None):
+def safe_baostock_transport(before_request=None, outcome=None, timeout=12):
     # Only the isolated provider worker is patched, never site-packages or other apps.
     from baostock.util import socketutil
     from baostock.common import context, contants
@@ -111,7 +111,7 @@ def safe_baostock_transport(before_request=None, outcome=None):
         # turn repeated manual syncs into repeated connection attempts.
         if before_request:before_request();first_reserved=True
         host = contants.BAOSTOCK_VIP_SERVER_IP if api_key.startswith('bs-') else contants.BAOSTOCK_SERVER_IP
-        transport = Transport(host, contants.BAOSTOCK_SERVER_PORT)
+        transport = Transport(host, contants.BAOSTOCK_SERVER_PORT,timeout=timeout)
         try:context.default_socket = transport.connect()
         except BaoTransportError as exc:
             if outcome:outcome(exc)

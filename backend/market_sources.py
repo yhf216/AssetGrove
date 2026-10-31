@@ -157,7 +157,8 @@ def _query(action, payload, budget=None):
                 values.append(dict(zip(result.fields,result.get_row_data())))
             if result.error_code!='0':raise ValueError(result.error_msg or '历史分页查询失败')
             return values
-        transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error)) if budget else safe_baostock_transport()
+        transport_options={'timeout':60} if action=='market_breadth_days' else {}
+        transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error),**transport_options) if budget else safe_baostock_transport(**transport_options)
         with transport:
             login=bs.login()
             if login.error_code!='0':
