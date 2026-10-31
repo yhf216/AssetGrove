@@ -73,7 +73,7 @@ function update(){
 function updateRange(){
   const options=chart?.getOption() as any,dates=options?.xAxis?.[0]?.data || [],z=options?.dataZoom?.[0]
   if(!dates.length){range.value='暂无历史数据';return}
-  const first=Math.max(0,Math.floor((z?.start || 0)/100*(dates.length-1))),last=Math.min(dates.length-1,Math.ceil((z?.end ?? 100)/100*(dates.length-1)))
+  const first=Math.max(0,Math.floor((z?.start || 0)/100*(dates.length-1)+1e-7)),last=Math.min(dates.length-1,Math.ceil((z?.end ?? 100)/100*(dates.length-1)-1e-7))
   range.value=`显示区间 ${dates[first]} — ${dates[last]}`
 }
 function reset(){zoom=null;update()}
