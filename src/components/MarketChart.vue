@@ -63,7 +63,7 @@ function update(){
     xAxis:axes.map(index=>({type:'category',gridIndex:index,data:dates,boundaryGap:true,axisLabel:{show:index===axes.at(-1),color:ink,fontSize:fontSize.value*.75,hideOverlap:true},axisLine:{lineStyle:{color:border}},axisTick:{show:false}})),
     yAxis:[{type:'value',gridIndex:0,scale:true,name:normalized?'基准 100':'指数点位',nameTextStyle:{color:ink},axisLabel:{color:ink},splitLine:{lineStyle:{color:border,type:'dashed'}}},
       {type:'value',gridIndex:0,scale:true,position:'right',show:prefs.trin_enabled,name:'TRIN',nameTextStyle:{color:'#bd9147'},axisLabel:{color:'#bd9147'},splitLine:{show:false}},
-      ...(prefs.erp_enabled?[{type:'value',gridIndex:0,scale:true,position:'right',offset:prefs.trin_enabled?60:0,name:'ERP（百分点）',nameTextStyle:{color:'#7b72b4'},axisLabel:{color:'#7b72b4',formatter:(v:number)=>v.toFixed(1)},splitLine:{show:false}}]:[]),
+      ...(prefs.erp_enabled?[{type:'value',gridIndex:0,scale:true,position:'right',offset:prefs.trin_enabled?60:0,name:'ERP',nameTextStyle:{color:'#7b72b4'},axisLabel:{color:'#7b72b4',formatter:(v:number)=>v.toFixed(2)},splitLine:{show:false}}]:[]),
       ...(prefs.volume_enabled?[{type:'value',gridIndex:1,scale:true,splitNumber:2,name:'成交量（股）',nameTextStyle:{color:ink},axisLabel:{color:ink,formatter:(v:number)=>Math.abs(v)>=1e8?(v/1e8).toFixed(1)+'亿':Math.round(v/1e4)+'万'},splitLine:{show:false}}]:[])],
     dataZoom:[{type:'inside',xAxisIndex:axes,filterMode:'filter',zoomOnMouseWheel:'ctrl',moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || initialZoom)},
       {type:'slider',xAxisIndex:axes,filterMode:'filter',bottom:9,height:22,borderColor:border,textStyle:{color:ink},...(zoom || initialZoom)}],series},true)
