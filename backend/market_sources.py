@@ -62,6 +62,16 @@ def query(action,payload):
 
 
 def _query(action, payload, budget=None):
+    def checkpoint(values,first,last,allowed=None):
+        if not payload.get('_market_cache'):return
+        import sqlite3
+        from contextlib import closing
+        from .market_cache import save_breadth
+        # Commit each completed source query before requesting the next one.
+        # Cancellation or a killed worker must not lose already downloaded bars.
+        with closing(sqlite3.connect(payload['_market_cache'],timeout=15)) as db,db:
+            if allowed is None:allowed=[r[0] for r in db.execute('SELECT symbol FROM universe')]
+            save_breadth(db,values,allowed,first,last)
     if action=='market_universe_ak':
         import akshare as ak
         result={}
@@ -119,7 +129,7 @@ def _query(action, payload, budget=None):
             if not quote or not quote['timestamp_verified'] or quote['date']!=day:raise ValueError('批量快照样本未齐，保留已缓存的 TRIN')
             records.append({'symbol':code,'change':quote['change'],'volume':quote['volume'],'trading':int(Decimal(quote['price'])>0)})
         return {'source':'新浪财经 / 批量行情','date':day,'received_at':now().isoformat(),'provisional':day==now().date().isoformat() and now().strftime('%H:%M')<'15:10','stocks':records}
-    if action in {'market_universe','market_breadth_batch','market_calendar'}:
+    if action in {'market_universe','market_breadth_batch','market_breadth_days','market_calendar'}:
         import baostock as bs
         def consume(result):
             if result.error_code!='0':
@@ -139,12 +149,29 @@ def _query(action, payload, budget=None):
                     return [r for r in consume(bs.query_stock_basic()) if r.get('type')=='1' and re.fullmatch(r'(sh\.(60|68)|sz\.(00|30))\d{4}',r['code'])]
                 if action=='market_calendar':
                     return consume(bs.query_trade_dates(start_date=payload['start'],end_date=payload['end']))
+                if action=='market_breadth_days':
+                    records,completed,errors=[],[],[]
+                    for day in payload['dates']:
+                        try:
+                            values=consume(bs.query_daily_history_k_AStock(date=day))
+                            # Reject wrong-session responses and unrelated markets.
+                            values=[r for r in values if r.get('date')==day and re.fullmatch(r'(sh\.(60|68)|sz\.(00|30))\d{4}',r.get('code',''))]
+                            if not values:raise ValueError('全市场日线响应为空，保留缺口')
+                            checkpoint(values,day,day)
+                            records.extend(values);completed.append(day)
+                        except MarketLimit as exc:
+                            return {'records':records,'completed':completed,'errors':errors,'limited':True,'retry_at':exc.retry_at,'source':exc.source,'error':str(exc)}
+                        except Exception as exc:
+                            errors.append({'date':day,'error':str(exc)[:180]})
+                            break
+                    return {'records':records,'completed':completed,'errors':errors}
                 records, completed, errors = [], [], []
                 for index,code in enumerate(payload['symbols']):
                     if index:time.sleep(max(0,float(payload.get('request_interval',1.0))))
                     try:
                         values=consume(bs.query_history_k_data_plus(code,'date,code,close,preclose,volume,pctChg,tradestatus',start_date=payload['start'],end_date=payload['end'],frequency='d',adjustflag='3'))
                         if not values:raise ValueError('历史响应为空，保留缺口等待重试')
+                        checkpoint(values,payload['start'],payload['end'],[code])
                         records.extend(values);completed.append(code)
                     except MarketLimit as exc:
                         return {'records':records,'completed':completed,'errors':errors,'limited':True,'retry_at':exc.retry_at,'source':exc.source,'error':str(exc)}

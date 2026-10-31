@@ -13,8 +13,8 @@ import time
 
 from .providers import fetch
 from .storage import now, rows
-from .market_cache import install_cache, calculate_trin
-from .market_history import quarter_ranges, repair_priority
+from .market_cache import install_cache, calculate_trin, save_breadth
+from .market_history import repair_ranges, repair_priority, history_work
 from .market_network import MarketBudget, MarketLimit
 from .sync_schedule import TIMES
 
@@ -320,7 +320,6 @@ class MarketService:
         self.progress={'running':False,'phase':'','done':0,'total':0,'errors':[],'revision':0}
         self.calculation={'running':False,'done':0,'total':0,'error':''}
         self.calculation_cancel=threading.Event()
-        if not self.store.setting('history_enabled',default=True):self.calculation_cancel.set()
         self.thread=None;self.request_interval=1.5;self.last_request=0
         self.index_refresh=False;self.index_target=None
         self.manual=False
@@ -339,17 +338,13 @@ class MarketService:
     def pause(self):
         self.store.setting('history_enabled',False,write=True)
         self.cancel.set()
-        self.calculation_cancel.set()
 
     def background(self,enabled):
         if type(enabled) is not bool:raise ValueError('无效的后台回补设置')
         self.store.setting('history_enabled',enabled,write=True)
         if enabled:
             self.store.setting('history_next_at',0,write=True)
-            self.calculation_cancel.clear()
-        else:
-            self.calculation_cancel.set()
-            if self.progress.get('kind')=='history':self.cancel.set()
+        elif self.progress.get('kind')=='history':self.cancel.set()
 
     def request(self,action,payload,timeout=60):
         if self.cancel.wait(max(0,self.request_interval-(time.monotonic()-self.last_request))):
@@ -377,7 +372,10 @@ class MarketService:
         with self.store.connect() as db:
             stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM trin WHERE value IS NOT NULL').fetchone()
             latest=db.execute('SELECT * FROM trin WHERE value IS NOT NULL ORDER BY date DESC LIMIT 1').fetchone()
+            pending=db.execute('SELECT COUNT(*) FROM trin WHERE value IS NULL').fetchone()[0]
+            gap=db.execute('SELECT date,coverage,reason FROM trin WHERE value IS NULL ORDER BY date DESC LIMIT 1').fetchone()
         return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'calculation':calculation,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
+                'history_pending':{'count':pending,'latest':dict(gap) if gap else None},
                 'network':{**self.network.status(),'message':self.store.setting('market_network_message',default=''),'retry_at':self.store.setting('market_network_retry',default=0)},
                 'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':' / '.join(TIMES),'error':self.store.setting('background_error',default='')}}
 
@@ -477,19 +475,7 @@ class MarketService:
         self.store.save_snapshot(result['data']);self.changed();self.update(done=len(indices)+1)
 
     def save_breadth(self,records,allowed,start,end):
-        values=[]
-        for r in records:
-            if r['code'] not in allowed or not start<=r['date']<=end:continue
-            try:
-                change=finite(r['pctChg']) if r.get('pctChg') not in {None,''} else None
-                volume=finite(r['volume']) if r.get('volume') not in {None,''} else 0
-                trading=int(r.get('tradestatus') or 0)
-                if volume<0 or (trading and change is None):continue
-                values.append((r['code'],r['date'],change,volume,trading))
-            except (ValueError,TypeError):continue
-        with self.store.connect() as db:db.executemany('''INSERT INTO breadth VALUES(?,?,?,?,?) ON CONFLICT(symbol,date) DO UPDATE SET
-            change=excluded.change,volume=excluded.volume,trading=excluded.trading
-            WHERE breadth.change IS NOT excluded.change OR breadth.volume IS NOT excluded.volume OR breadth.trading IS NOT excluded.trading''',values)
+        with self.store.connect() as db:save_breadth(db,records,allowed,start,end)
 
     def backfill(self,start,end,budget=None):
         self.update(kind='history')
@@ -530,6 +516,12 @@ class MarketService:
         expected,missing=self.store.history_gaps(start,end)
         missing=set(missing)
         self.update(total=len(expected),done=len(expected)-len(missing))
+        # Publish usable cached inputs before deciding whether any network work
+        # is necessary. Verified daily snapshots need no duplicate raw download.
+        self.store.enqueue_calculations(start,end)
+        self.store.calculate_pending(cancel=self.cancel,start=start,end=end)
+        work_start,work_end,work_days,sparse=history_work(self.store,start,end)
+        if not work_days:return {'complete':True,'wait':30}
         failures=self.store.setting('history_failures',default={})
         stock_failures=self.store.setting('history_stock_failures',default={})
         # Chunk keys survive changes to the selected overall range. Old failure
@@ -544,20 +536,24 @@ class MarketService:
         plans=defaultdict(list)
         for symbol in sorted(missing):
             if stock_failures.get(symbol,{}).get('next',0)>now().timestamp():continue
-            for gap_start,gap_end in self.store.missing_ranges(symbol,start,end):
-                for first,last in quarter_ranges(gap_start,gap_end):
+            for gap_start,gap_end in self.store.missing_ranges(symbol,work_start,work_end):
+                for first,last in repair_ranges(gap_start,gap_end):
                     state=failure_for(symbol,first,last)
                     if state.get('next',0)<=now().timestamp():plans[(first,last)].append(symbol)
+        # Sparse whole-market history is cheaper by day; almost-complete years
+        # are cheaper by stock. Both paths use the exact same request budget.
+        if sparse and len(work_days)<sum(map(len,plans.values())) and self.store.setting('history_daily_disabled_until',default=0)<=now().timestamp():
+            return self.backfill_days(start,end,work_days,budget,began)
         exhausted=False
         deferred=None
         for (first,last),symbols in sorted(plans.items(),key=repair_priority(self.store,start,end),reverse=True):
-            for offset in range(0,len(symbols),2):
+            for offset in range(0,len(symbols),8):
                 if self.cancel.is_set():return
-                batch=[s for s in symbols[offset:offset+2] if failure_for(s,first,last).get('next',0)<=now().timestamp() and stock_failures.get(s,{}).get('next',0)<=now().timestamp()]
+                batch=[s for s in symbols[offset:offset+8] if failure_for(s,first,last).get('next',0)<=now().timestamp() and stock_failures.get(s,{}).get('next',0)<=now().timestamp()]
                 if not batch:continue
                 self.update(phase=f'补齐历史缺口 {len(expected)-len(missing)} / {len(expected)}')
                 primary_cooling=False
-                try:response=self.request('market_breadth_batch',{'symbols':batch,'start':first,'end':last,'request_interval':30.0},timeout=240)
+                try:response=self.request('market_breadth_batch',{'symbols':batch,'start':first,'end':last,'request_interval':30.0},timeout=900)
                 except MarketLimit as exc:
                     if not exc.source:raise
                     primary_cooling=True
@@ -602,6 +598,9 @@ class MarketService:
                         with self.lock:self.progress['errors'].append(code+'：'+errors.get(code,'历史行数不足，已保存有效数据并延后重试'))
                 self.store.setting('history_failures',failures,write=True)
                 self.store.setting('history_stock_failures',stock_failures,write=True)
+                # Publish repaired days after each saved batch, even if a later
+                # batch times out or exhausts today's network budget.
+                self.store.calculate_pending(cancel=self.cancel,start=first,end=last)
                 self.update(done=len(expected)-len(missing))
                 if deferred:exhausted=True;break
                 if budget is not None and time.monotonic()-began>=budget:exhausted=True;break
@@ -618,3 +617,42 @@ class MarketService:
             retries=[v.get('next',0) for k,v in failures.items() if k.split(':')[0] in missing]+[v.get('next',0) for k,v in stock_failures.items() if k in missing]
             if not plans and retries:wait=max(60,min(retries)-now().timestamp())
         return {'complete':not missing,'wait':wait}
+
+    def backfill_days(self,start,end,days,budget,began):
+        failures=self.store.setting('history_day_failures',default={})
+        pending=[day for day in reversed(days) if failures.get(day,{}).get('next',0)<=now().timestamp()]
+        with self.store.connect() as db:allowed=[r[0] for r in db.execute('SELECT symbol FROM universe')]
+        for offset in range(0,len(pending),8):
+            if self.cancel.is_set():return
+            batch=pending[offset:offset+8]
+            self.update(phase=f'按交易日补齐全市场历史 {batch[-1]} — {batch[0]}')
+            try:response=self.request('market_breadth_days',{'dates':batch},timeout=900)
+            except MarketLimit:raise
+            if self.cancel.is_set():return
+            if not response['ok']:
+                # Unsupported SDK/server or an unavailable endpoint must not
+                # repeatedly consume the budget; retain the stock route.
+                self.store.setting('history_daily_disabled_until',now().timestamp()+86400,write=True)
+                with self.lock:self.progress['errors'].append(response.get('error','全市场日线查询失败')[:250])
+                return {'complete':False,'wait':900}
+            data=response['data']
+            self.save_breadth(data['records'],allowed,min(batch),max(batch))
+            self.store.calculate_pending(cancel=self.cancel,start=min(batch),end=max(batch))
+            _,_,remaining,_=history_work(self.store,min(batch),max(batch))
+            gaps=set(remaining)
+            errors={r['date']:r['error'] for r in data.get('errors',[])}
+            for day in batch:
+                if day not in gaps:failures.pop(day,None)
+                elif not data.get('limited'):
+                    attempts=failures.get(day,{}).get('attempts',0)+1
+                    failures[day]={'attempts':attempts,'next':now().timestamp()+min(86400,900*2**min(attempts-1,7))}
+                    with self.lock:self.progress['errors'].append(day+'：'+errors.get(day,'全市场历史样本未齐，稍后重试'))
+            self.store.setting('history_day_failures',failures,write=True)
+            if data.get('limited'):raise MarketLimit(data['error'],data['retry_at'],data.get('source',''))
+            if errors:
+                self.store.setting('history_daily_disabled_until',now().timestamp()+86400,write=True)
+                break
+            if budget is not None and time.monotonic()-began>=budget:break
+        _,_,remaining,_=history_work(self.store,start,end)
+        wait=max(60,min((value['next'] for day,value in failures.items() if day in remaining),default=now().timestamp())-now().timestamp()) if not pending else 60
+        return {'complete':not remaining,'wait':wait}

@@ -32,7 +32,7 @@ class MarketScheduler:
             if self.stop.wait(5):return
 
     def calculate(self):
-        if self.stop.is_set() or not self.store.setting('history_enabled',default=True):return 0
+        if self.stop.is_set():return 0
         with self.service.lock:self.service.calculation.update(running=True,done=0,total=0,error='')
         try:
             def progress(done,total):
@@ -58,16 +58,17 @@ class MarketScheduler:
         today=moment.date().isoformat()
         with self.store.connect() as db:trading=db.execute('SELECT trading FROM calendar WHERE date=?',(today,)).fetchone()
         slot=automatic_slot(moment,trading[0] if trading else None)
-        if not slot:return
-        if self.store.setting('market_auto_attempt')!=slot:
+        if slot and self.store.setting('market_auto_attempt')!=slot:
             self.service.start('indices',daily_target=today,automatic=slot)
             return
         if not self.store.setting('history_enabled',default=True):return
-        # A single small history batch after the closing update. No automatic
-        # retry loops, including after restarts, pause/resume or old retry timers.
-        if not slot.endswith(TIMES[-1]) or self.store.setting('history_auto_attempt')==today:return
-        if self.store.setting('market_auto_completed')!=slot:return
-        self.store.setting('history_auto_attempt',today,write=True)
+        # Historical repairs are independent of today's two refresh windows.
+        # Continue on weekends and after restart, within the same strict budget.
+        if self.store.setting('history_next_at',default=0)>moment.timestamp():return
+        next_at=self.service.network.next_history_at(moment)
+        if next_at>moment.timestamp():
+            self.store.setting('history_next_at',next_at,write=True)
+            return
         target=last_closed_day(self.store,moment)
         plan=self.store.setting('history_plan')
         if not plan:
@@ -77,7 +78,7 @@ class MarketScheduler:
             start=bounds[0] if bounds[0] and bounds[0]<=end else str(date.fromisoformat(end)-timedelta(days=120))
             plan={'start':start,'end':end}
             self.store.setting('history_plan',plan,write=True)
-        self.service.start('history',plan['start'],plan['end'],budget=0,managed=True)
+        self.service.start('history',plan['start'],plan['end'],budget=300,managed=True)
 
     def completed(self,start,end,result):
         if not result:return

@@ -75,3 +75,15 @@ class MarketBudget:
         with self.connect() as db:
             used,automatic,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope NOT LIKE 'manual:%'),0),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight,)).fetchone()
         return {'used':used,'limit':DAILY_LIMIT,'automatic_used':automatic,'automatic_limit':AUTOMATIC_DAILY_LIMIT,'history_used':history,'history_limit':HISTORY_DAILY_LIMIT,'hourly_limit':HOURLY_LIMIT,'interval':INTERVAL}
+
+    def next_history_at(self,moment=None):
+        """Read-only scheduling check; workers still reserve every wire request."""
+        moment=moment or now();stamp=moment.timestamp()
+        midnight=moment.replace(hour=0,minute=0,second=0,microsecond=0)
+        with self.connect() as db:
+            daily,automatic,history=db.execute("SELECT COUNT(*),COALESCE(SUM(scope NOT LIKE 'manual:%'),0),COALESCE(SUM(scope='history'),0) FROM market_requests WHERE at>=?",(midnight.timestamp(),)).fetchone()
+            count,first,last=db.execute('SELECT COUNT(*),MIN(at),MAX(at) FROM market_requests WHERE at>?',(stamp-3600,)).fetchone()
+        if daily>=DAILY_LIMIT or automatic>=AUTOMATIC_DAILY_LIMIT or history>=HISTORY_DAILY_LIMIT:
+            return (midnight+timedelta(days=1)).timestamp()
+        if count>=HOURLY_LIMIT:return first+3600.01
+        return max(stamp,(last or 0)+INTERVAL)
