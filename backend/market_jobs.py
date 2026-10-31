@@ -69,6 +69,10 @@ class MarketScheduler:
         if next_at>moment.timestamp():
             self.store.setting('history_next_at',next_at,write=True)
             return
+        if self.store.setting('erp_requested',default=False) and self.store.setting('erp_history_attempt')!=today:
+            self.store.setting('erp_history_attempt',today,write=True)
+            self.service.start('erp',managed=True)
+            return
         target=last_closed_day(self.store,moment)
         plan=self.store.setting('history_plan')
         if not plan:
@@ -78,11 +82,25 @@ class MarketScheduler:
             start=bounds[0] if bounds[0] and bounds[0]<=end else str(date.fromisoformat(end)-timedelta(days=120))
             plan={'start':start,'end':end}
             self.store.setting('history_plan',plan,write=True)
+        # Visible gaps and the immediately preceding sessions take priority over
+        # extending a remote, mostly empty year. Never interpolate missing values.
+        with self.store.connect() as db:
+            bounds=db.execute('SELECT MIN(date),MAX(date) FROM trin WHERE value IS NOT NULL').fetchone()
+            if bounds[0]:
+                repair=db.execute('''SELECT MIN(c.date),MAX(c.date) FROM calendar c WHERE c.trading=1 AND c.date BETWEEN ? AND ?
+                    AND NOT EXISTS(SELECT 1 FROM trin t WHERE t.date=c.date AND t.value IS NOT NULL)
+                    AND (c.date>=? OR EXISTS(SELECT 1 FROM breadth b WHERE b.date=c.date))''',
+                    (str(date.fromisoformat(bounds[0])-timedelta(days=31)),bounds[1],bounds[0])).fetchone()
+                if repair[0]:plan={'start':repair[0],'end':repair[1]}
         self.service.start('history',plan['start'],plan['end'],budget=300,managed=True)
 
     def completed(self,start,end,result):
         if not result:return
         if result['complete']:
+            saved=self.store.setting('history_plan')
+            if saved and saved!={'start':start,'end':end}:
+                self.store.setting('history_next_at',now().timestamp()+30,write=True)
+                return
             target=last_closed_day(self.store)
             oldest=min(start,self.store.setting('oldest_complete',default=start))
             self.store.setting('oldest_complete',oldest,write=True)

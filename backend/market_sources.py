@@ -72,6 +72,24 @@ def _query(action, payload, budget=None):
         with closing(sqlite3.connect(payload['_market_cache'],timeout=15)) as db,db:
             if allowed is None:allowed=[r[0] for r in db.execute('SELECT symbol FROM universe')]
             save_breadth(db,values,allowed,first,last)
+    if action=='market_erp_pe':
+        import akshare as ak
+        frame=ak.stock_index_pe_lg(symbol='沪深300')
+        return [{'date':str(r['日期'])[:10],'pe':r['滚动市盈率'],'source':'乐咕乐股 / 沪深300整体法滚动市盈率'} for r in _records(frame)]
+    if action=='market_erp_bond':
+        import akshare as ak
+        frame=ak.bond_china_yield(start_date=payload['start'].replace('-',''),end_date=payload['end'].replace('-',''))
+        records=[{'date':str(r['日期'])[:10],'yield10':r['10年'],'source':'中债 / 中国10年期国债收益率'} for r in _records(frame) if str(r.get('曲线名称','')) in {'中债国债收益率曲线','国债收益率曲线'}]
+        if not records:raise ValueError('未取得明确的中国10年期国债曲线')
+        return records
+    if action=='market_erp_bond_em':
+        import requests
+        response=requests.get('https://datacenter.eastmoney.com/api/data/v1/get',params={
+            'reportName':'RPTA_WEB_TREASURYYIELD','columns':'SOLAR_DATE,EMM00166466','sortColumns':'SOLAR_DATE','sortTypes':'-1','pageSize':1000,'pageNumber':1,
+            'filter':f"(SOLAR_DATE>='{payload['start']}')(SOLAR_DATE<='{payload['end']}')"},timeout=12)
+        response.raise_for_status();result=response.json().get('result')
+        if not result or int(result.get('pages',1))>1:raise ValueError('国债区间未完整返回，保留缓存等待重试')
+        return [{'date':str(r['SOLAR_DATE'])[:10],'yield10':r['EMM00166466'],'source':'东方财富 / 中国10年期国债收益率'} for r in result['data'] if payload['start']<=str(r['SOLAR_DATE'])[:10]<=payload['end']]
     if action=='market_universe_ak':
         import akshare as ak
         result={}
