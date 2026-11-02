@@ -69,7 +69,7 @@ class MarketScheduler:
         if next_at>moment.timestamp():
             self.store.setting('history_next_at',next_at,write=True)
             return
-        if self.store.setting('erp_requested',default=False) and self.store.setting('erp_history_attempt')!=today:
+        if (self.store.setting('erp_requested',default=False) or self.store.setting('valuation_requested',default=False)) and self.store.setting('erp_history_attempt')!=today:
             self.store.setting('erp_history_attempt',today,write=True)
             self.service.start('erp',managed=True)
             return

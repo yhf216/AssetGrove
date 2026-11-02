@@ -39,14 +39,14 @@ function update(){
   if(prefs.trin_enabled)series.push({name:prefs.period==='d'?'TRIN':'TRIN（日值均值）',type:'line',xAxisIndex:0,yAxisIndex:1,connectNulls:false,showSymbol:true,symbolSize:6,lineStyle:{width:1.4,color:'#bd9147'},itemStyle:{color:'#bd9147'},data:dates.map(day=>trin.get(day)?.value ?? null),markLine:{silent:true,symbol:'none',label:{formatter:'TRIN = 1'},lineStyle:{color:'#bd9147',type:'dashed'},data:[{yAxis:1}]}})
   const erp=new Map<string,any>((props.history.erp || []).map((r:any)=>[r.date,r]))
   if(prefs.erp_enabled){
-    const monthly=props.history.erp_frequency==='monthly',segments:any[][]=[[]]
+    const monthly=props.history.erp_frequency==='monthly',weekly=props.history.erp_frequency==='weekly',sparse=monthly || weekly,segments:any[][]=[[]]
     for(const row of props.history.erp || []){
-      if(monthly && row.value==null){if(segments.at(-1)!.length)segments.push([])}
+      if(sparse && row.value==null){if(segments.at(-1)!.length)segments.push([])}
       else segments.at(-1)!.push(row)
     }
-    for(const segment of (monthly?segments:[props.history.erp || []])){
+    for(const segment of (sparse?segments:[props.history.erp || []])){
       const values=new Map<string,any>(segment.map((r:any)=>[r.date,r]))
-      series.push({name:monthly?'ERP（月度·沪深300）':prefs.period==='d'?'ERP（沪深300）':'ERP（日值均值）',type:'line',xAxisIndex:0,yAxisIndex:2,connectNulls:monthly,showSymbol:true,symbolSize:6,lineStyle:{width:1.5,color:'#7b72b4'},itemStyle:{color:'#7b72b4'},data:dates.map(day=>values.get(day)?.value ?? null),tooltip:{formatter:(p:any)=>`${p.seriesName}<br/>${erp.get(p.name)?.observed_date || p.name}<br/>${Number(p.value).toFixed(2)} 个百分点`}})
+      series.push({name:monthly?'ERP（月·沪深300）':weekly?'ERP（周·沪深300）':'ERP（日·沪深300）',type:'line',xAxisIndex:0,yAxisIndex:2,connectNulls:sparse,showSymbol:true,symbolSize:6,lineStyle:{width:1.5,color:'#7b72b4'},itemStyle:{color:'#7b72b4'},data:dates.map(day=>values.get(day)?.value ?? null),tooltip:{formatter:(p:any)=>`${p.seriesName}<br/>${erp.get(p.name)?.observed_date || p.name}<br/>${Number(p.value).toFixed(2)} 个百分点`}})
     }
   }
   if(prefs.volume_enabled)series.push({name:'主指数成交量',type:'bar',xAxisIndex:1,yAxisIndex:prefs.erp_enabled?3:2,progressive:1000,barMaxWidth:8,data:dates.map(day=>{const b=bySymbol[primary]?.get(day);return b?{value:b.volume,itemStyle:{color:b.close>=b.open?'#d96666':'#4c9d7b'}}:null})})

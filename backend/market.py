@@ -18,6 +18,8 @@ from .market_history import repair_ranges, repair_priority, history_work
 from .market_network import MarketBudget, MarketLimit
 from .sync_schedule import TIMES
 from .market_erp import save_component, calculate_pending as calculate_erp
+from .market_reference import INDICES as VALUATION_INDICES, PE_SOURCE
+from .market_valuation import save as save_valuation, history as valuation_history, sample as sample_indicator, describe, percentile
 
 INDICES = [
     {'symbol':'sh000001','name':'上证指数'}, {'symbol':'sz399102','name':'创业板综指'},
@@ -28,7 +30,8 @@ INDICES = [
 ]
 SYMBOLS = {r['symbol'] for r in INDICES}
 DEFAULT_PREFS = {'symbols':['sh000001'],'period':'d','chart_type':'candlestick','ma_enabled':False,
-                 'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True}
+                 'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True,
+                 'indicator_period':'w','valuation_enabled':False,'valuation_symbol':'sh000300','valuation_years':10}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(symbol,date));
@@ -104,6 +107,8 @@ class MarketStore:
                     prefs={**json.loads(old[0]),'trin_enabled':False,'erp_enabled':False}
                     db.execute("UPDATE meta SET value=? WHERE key='preferences'",(json.dumps(prefs,ensure_ascii=False),))
                 db.execute("INSERT INTO meta VALUES('indicator_display_defaults','1')")
+        from .market_reference import bootstrap
+        bootstrap(self,now().date().isoformat())
 
     @contextmanager
     def connect(self):
@@ -246,10 +251,14 @@ class MarketStore:
                 if prefs['period'] not in {'d','w','m'} or prefs['chart_type'] not in {'line','candlestick'}:raise ValueError('无效图表周期')
                 values=prefs['ma_periods']
                 if not isinstance(values,list) or not 1<=len(values)<=8 or any(type(n) is not int or not 1<=n<=1000 for n in values) or len(values)!=len(set(values)):raise ValueError('均线周期须为 1–1000 天，最多 8 条且不能重复')
-                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','normalize']:
+                if prefs['indicator_period'] not in {'d','w'}:raise ValueError('长期指标仅支持日频或周频')
+                if prefs['valuation_symbol'] not in VALUATION_INDICES:raise ValueError('请选择支持的估值指数')
+                if type(prefs['valuation_years']) is not int or prefs['valuation_years'] not in {0,10}:raise ValueError('估值统计请选择近十年或全部历史')
+                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize']:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
                 if prefs['erp_enabled']:db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             return prefs
 
     def save_index(self,symbol,result):
@@ -296,6 +305,8 @@ class MarketStore:
             pe_count,months=db.execute('SELECT COUNT(*),COUNT(DISTINCT SUBSTR(date,1,7)) FROM erp_pe').fetchone()
             erp_frequency='monthly' if pe_count and pe_count<=months*1.1 else 'daily'
             erp=rows(db,'SELECT p.date,e.value,p.pe,e.bond_yield,p.source pe_source,e.bond_source FROM erp_pe p LEFT JOIN erp e ON e.date=p.date ORDER BY p.date') if pe_count else rows(db,'SELECT * FROM erp ORDER BY date')
+            reference=any(r['pe_source']==PE_SOURCE for r in erp)
+            if reference:erp=[r for r in erp if r['pe_source']==PE_SOURCE];erp_frequency='daily'
             if prefs['period']!='d':
                 groups=defaultdict(list);expected=defaultdict(set)
                 for bars in daily.values():
@@ -308,12 +319,13 @@ class MarketStore:
                     day=max(expected[key] | {r['date'] for r in group})
                     result.append({**group[-1],'date':day,'value':sum(r['value'] for r in group)/len(group) if complete else None,'provisional':any(r['provisional'] for r in group),'observations':len(group),'reason':'' if complete else '所选周期的历史日值未齐'})
                 trin=result
-                groups=defaultdict(list)
-                for row in erp:groups[period_key(row['date'],prefs['period'])].append(row)
-                erp=[{**group[-1],'date':max(expected[key] | {r['date'] for r in group}),'observed_date':group[-1]['date'],
-                      'value':group[-1]['value'] if erp_frequency=='monthly' else sum(r['value'] for r in group)/len(group) if expected[key]<={r['date'] for r in group if r['value'] is not None} else None,
-                      'observations':len(group)} for key,group in groups.items()]
-            result={'preferences':prefs,'series':series,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
+            erp_values=[r['value'] for r in erp if r['value'] is not None]
+            erp_statistics=describe(erp_values)
+            if erp_statistics:erp_statistics['percentile']=percentile(sorted(erp_values),erp_values[-1])
+            indicator_period=prefs['indicator_period'] if prefs['period']=='d' else prefs['period']
+            erp=sample_indicator(erp,indicator_period)
+            if erp_frequency!='monthly':erp_frequency={'w':'weekly','m':'monthly','d':'daily'}[indicator_period]
+            result={'preferences':prefs,'series':series,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
             self.history_cache[key]=result
             while len(self.history_cache)>3 or (len(self.history_cache)>1 and sum(sum(len(v) for v in item['series'].values())+len(item['trin']) for item in self.history_cache.values())>100000):
                 self.history_cache.popitem(last=False)
@@ -393,9 +405,13 @@ class MarketService:
             gap=db.execute('SELECT t.date,t.coverage,t.reason FROM trin t LEFT JOIN calendar c ON c.date=t.date WHERE t.value IS NULL AND (c.trading IS NULL OR c.trading=1) ORDER BY t.date DESC LIMIT 1').fetchone()
             erp_stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM erp').fetchone()
             latest_erp=db.execute('SELECT * FROM erp ORDER BY date DESC LIMIT 1').fetchone()
+            if db.execute('SELECT 1 FROM erp_pe WHERE source=? LIMIT 1',(PE_SOURCE,)).fetchone():
+                erp_stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM erp WHERE pe_source=?',(PE_SOURCE,)).fetchone()
+                latest_erp=db.execute('SELECT * FROM erp WHERE pe_source=? ORDER BY date DESC LIMIT 1',(PE_SOURCE,)).fetchone()
         return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'calculation':calculation,'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
                 'history_pending':{'count':pending,'latest':dict(gap) if gap else None},
                 'erp_coverage':{'count':erp_stats[0],'first':erp_stats[1],'last':erp_stats[2]},'latest_erp':dict(latest_erp) if latest_erp else None,'erp_error':self.store.setting('erp_error',default=''),
+                'valuation_catalog':[{'symbol':symbol,'name':entry[0]} for symbol,entry in VALUATION_INDICES.items()],
                 'network':{**self.network.status(),'message':self.store.setting('market_network_message',default=''),'retry_at':self.store.setting('market_network_retry',default=0)},
                 'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':' / '.join(TIMES),'error':self.store.setting('background_error',default='')}}
 
@@ -454,45 +470,46 @@ class MarketService:
         return True
 
     def sync_erp(self,history=False):
-        if not self.store.setting('erp_requested',default=False) or self.cancel.is_set():return
+        erp_requested=self.store.setting('erp_requested',default=False)
+        valuation_requested=self.store.setting('valuation_requested',default=False)
+        if not (erp_requested or valuation_requested) or self.cancel.is_set():return
         from .market_jobs import last_closed_day
-        target=last_closed_day(self.store);errors=[];attempted=False
-        with self.store.connect() as db:
-            pe_first,pe_last=db.execute('SELECT MIN(date),MAX(date) FROM erp_pe').fetchone()
-            bond_first,bond_last=db.execute('SELECT MIN(date),MAX(date) FROM erp_bond').fetchone()
-            bond_gap=db.execute('''SELECT MIN(p.date),MAX(p.date) FROM erp_pe p WHERE p.date BETWEEN ? AND ?
-                AND NOT EXISTS(SELECT 1 FROM erp_bond b WHERE b.date=p.date)''',(bond_first or target,min(target,bond_last or target))).fetchone()
-        if (not pe_last or pe_last<target) and (self.manual or self.store.setting('erp_pe_attempt')!=target):
-            self.store.setting('erp_pe_attempt',target,write=True)
+        target=date.fromisoformat(last_closed_day(self.store))
+        friday=(target-timedelta(days=(target.weekday()-4)%7)).isoformat()
+        today=now().date().isoformat();symbols=set()
+        if erp_requested:symbols.add('sh000300')
+        if valuation_requested:symbols.add(self.store.preferences()['valuation_symbol'])
+        tasks=[('index',symbol) for symbol in sorted(symbols)]
+        if erp_requested:tasks.append(('bond','bond'))
+        errors=[];attempted=False
+        for kind,key in tasks:
+            if self.cancel.is_set():return
+            stamp=self.store.setting('reference_'+key,default={})
+            if not self.manual and (stamp.get('asof','')>=friday or stamp.get('checked')==today):continue
             attempted=True
-            self.update(phase='读取沪深300滚动市盈率')
-            try:result=self.request('market_erp_pe',{},timeout=150)
+            self.store.setting('reference_'+key,{**stamp,'checked':today},write=True)
+            payload={'etag':stamp.get('etag')}
+            if kind=='index':payload['symbol']=key
+            self.update(phase='同步长期指标静态历史：'+(VALUATION_INDICES[key][0] if kind=='index' else '十年国债'))
+            try:response=self.request('market_reference_'+kind,payload,timeout=120)
             except MarketLimit as exc:
                 if not exc.source:raise
-                result={'ok':False,'error':str(exc)}
-            if result['ok']:
-                with self.store.connect() as db:
-                    save_component(db,'pe',result['data'],now().date().isoformat())
-                    pe_first,pe_last=db.execute('SELECT MIN(date),MAX(date) FROM erp_pe').fetchone()
-            else:errors.append(result.get('error','指数估值数据暂不可用'))
-        first=last=None
-        if not bond_last:first=str(date.fromisoformat(target)-timedelta(days=364));last=target
-        elif bond_gap[0]:first=bond_gap[0];last=min(bond_gap[1],str(date.fromisoformat(first)+timedelta(days=364)))
-        elif bond_last<target:first=str(date.fromisoformat(bond_last)+timedelta(days=1));last=min(target,str(date.fromisoformat(first)+timedelta(days=364)))
-        elif history and pe_first and bond_first>pe_first:
-            last=str(date.fromisoformat(bond_first)-timedelta(days=1));first=max(pe_first,str(date.fromisoformat(last)-timedelta(days=364)))
-        if first and (self.manual or self.store.setting('erp_bond_attempt')!=[first,last,target]):
-            self.store.setting('erp_bond_attempt',[first,last,target],write=True)
-            attempted=True
-            self.update(phase='读取中国10年期国债历史收益率')
-            try:result=self.request_with_backup('market_erp_bond','market_erp_bond_em',{'start':first,'end':last},timeout=150)
-            except MarketLimit as exc:
-                if not exc.source:raise
-                result={'ok':False,'error':str(exc)}
-            if result['ok']:
-                with self.store.connect() as db:save_component(db,'bond',result['data'],now().date().isoformat())
-            else:errors.append(result.get('error','国债收益率数据暂不可用'))
-        self.store.calculate_pending(cancel=self.cancel)
+                response={'ok':False,'error':str(exc)}
+            if not response['ok']:
+                errors.append(response.get('error','参考数据暂不可用'));continue
+            data=response['data']
+            if data.get('unchanged'):
+                if not stamp.get('asof'):errors.append('本地没有可复用的参考数据');continue
+                self.store.setting('reference_'+key,{**stamp,'checked':today,'etag':data.get('etag') or stamp.get('etag')},write=True)
+                continue
+            records=data['records']
+            with self.store.connect() as db:
+                if kind=='index':
+                    save_valuation(db,key,records)
+                    if key=='sh000300':save_component(db,'pe',records,today)
+                else:save_component(db,'bond',records,today)
+            self.store.setting('reference_'+key,{'checked':today,'asof':max(r['date'] for r in records),'etag':data.get('etag'),'sha256':data.get('sha256'),'url':data.get('url')},write=True)
+            self.store.calculate_pending(cancel=self.cancel,limit=10000)
         if attempted:self.store.setting('erp_error','；'.join(errors),write=True)
 
     def sync_indices(self):

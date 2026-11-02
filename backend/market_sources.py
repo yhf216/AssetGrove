@@ -72,6 +72,9 @@ def _query(action, payload, budget=None):
         with closing(sqlite3.connect(payload['_market_cache'],timeout=15)) as db,db:
             if allowed is None:allowed=[r[0] for r in db.execute('SELECT symbol FROM universe')]
             save_breadth(db,values,allowed,first,last)
+    if action in {'market_reference_index','market_reference_bond'}:
+        from .market_reference import query as reference_query
+        return reference_query('index' if action=='market_reference_index' else 'bond',payload,now().date().isoformat())
     if action=='market_erp_pe':
         import akshare as ak
         frame=ak.stock_index_pe_lg(symbol='沪深300')

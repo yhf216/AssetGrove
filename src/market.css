@@ -22,4 +22,18 @@
 .market-backfill { padding:1rem 1.2rem; }
 .market-backfill label { display:flex; flex-direction:column; gap:.4rem; }
 .market-backfill p { color:var(--muted); font-size:.875rem; margin:1rem 0; }
+.indicator-guide { padding:.8rem 1.2rem; }
+.indicator-guide summary { cursor:pointer; font-weight:600; }
+.indicator-guide-content { display:grid; gap:1rem; padding-top:1rem; }
+.indicator-guide h3,.market-valuation h3 { margin:0; font-size:1rem; }
+.indicator-guide p { line-height:1.65; margin:.6rem 0; }
+.indicator-guide table { width:100%; border-collapse:collapse; }
+.indicator-guide th,.indicator-guide td { text-align:left; padding:.6rem; border-bottom:1px solid var(--border); }
+.indicator-guide td:first-child { min-width:8rem; }
+.market-longterm-options,.market-valuation-top,.valuation-stats { display:flex; flex-wrap:wrap; align-items:center; gap:.7rem 1.3rem; }
+.market-longterm-options label,.market-valuation-top label { display:flex; align-items:center; gap:.5rem; }
+.market-valuation { padding:1rem 1.2rem; min-width:0; }
+.valuation-stats { padding:.9rem 0; color:var(--muted); font-size:.9rem; }
+.valuation-stats strong { color:var(--text); }
+.valuation-chart { height:25rem; min-width:0; width:100%; }
 @media(max-width:950px) { .market-controls,.market-plot { padding:.75rem; } .market-top { align-items:flex-start; } .market-backfill .form-row { grid-template-columns:1fr; } }
