@@ -15,6 +15,19 @@ def last_closed_day(store,moment=None):
     return day.isoformat()
 
 
+def recent_history_range(store,target):
+    """Unknown recent weekdays also need a calendar check before older work."""
+    end=date.fromisoformat(target);start=end-timedelta(days=89)
+    with store.connect() as db:
+        calendar=dict(db.execute('SELECT date,trading FROM calendar WHERE date BETWEEN ? AND ?',(str(start),target)))
+        ready={r[0] for r in db.execute('SELECT date FROM trin WHERE date BETWEEN ? AND ? AND value IS NOT NULL AND provisional=0',(str(start),target))}
+    pending=[]
+    for offset in range(90):
+        day=start+timedelta(days=offset);key=str(day)
+        if calendar.get(key,day.weekday()<5) and key not in ready:pending.append(key)
+    return {'start':pending[0],'end':pending[-1]} if pending else None
+
+
 class MarketScheduler:
     def __init__(self,service):
         self.service=service;self.store=service.store;self.stop=threading.Event();self.thread=None;self.calculation_thread=None
@@ -82,6 +95,7 @@ class MarketScheduler:
             start=bounds[0] if bounds[0] and bounds[0]<=end else str(date.fromisoformat(end)-timedelta(days=120))
             plan={'start':start,'end':end}
             self.store.setting('history_plan',plan,write=True)
+        recent=recent_history_range(self.store,target)
         # Visible gaps and the immediately preceding sessions take priority over
         # extending a remote, mostly empty year. Never interpolate missing values.
         with self.store.connect() as db:
@@ -92,6 +106,7 @@ class MarketScheduler:
                     AND (c.date>=? OR EXISTS(SELECT 1 FROM breadth b WHERE b.date=c.date))''',
                     (str(date.fromisoformat(bounds[0])-timedelta(days=31)),bounds[1],bounds[0])).fetchone()
                 if repair[0]:plan={'start':repair[0],'end':repair[1]}
+        if recent:plan=recent
         self.service.start('history',plan['start'],plan['end'],budget=300,managed=True)
 
     def completed(self,start,end,result):

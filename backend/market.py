@@ -80,7 +80,6 @@ def aggregate_bars(bars, period, ma_periods):
             if i>=n:sums[n]-=bars[i-n]['close']
             ma[str(n)]=sums[n]/n if i+1>=n else None
         daily.append({**bar,'ma':ma})
-    if period=='d':return daily
     groups={}
     for bar in daily:
         key=period_key(bar['date'],period)
@@ -88,7 +87,12 @@ def aggregate_bars(bars, period, ma_periods):
         else:
             group=groups[key]
             group.update(date=bar['date'],close=bar['close'],high=max(group['high'],bar['high']),low=min(group['low'],bar['low']),volume=group['volume']+bar['volume'],ma=bar['ma'])
-    return list(groups.values())
+    result=daily if period=='d' else list(groups.values())
+    previous=None
+    for bar in result:
+        bar['change_pct']=(bar['close']/previous-1)*100 if previous and previous>0 else None
+        previous=bar['close']
+    return result
 
 
 class MarketStore:
@@ -217,7 +221,7 @@ class MarketStore:
             if merged and first<=str(date.fromisoformat(merged[-1][1])+timedelta(days=1)):
                 merged[-1]=(merged[-1][0],max(last,merged[-1][1]))
             else:merged.append((first,last))
-        return merged
+        return list(reversed(merged))
 
     def calculate_pending(self,cancel=None,budget=2,limit=128,start='1990-01-01',end=None,progress=None):
         if not self.calculation_lock.acquire(blocking=False):return 0

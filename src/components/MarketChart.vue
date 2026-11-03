@@ -26,11 +26,17 @@ function update(){
     const first=bars.find((b:any)=>!common || b.date>=common)?.close
     const value=(v:any)=>v==null?null:normalized && first ? v/first*100 : v
     const name=props.catalog.find(c=>c.symbol===symbol)?.name || symbol
+    const changeLabel=prefs.period==='w'?'周涨跌幅':prefs.period==='m'?'月涨跌幅':'当日涨跌幅'
     const candle=symbols.length===1 && prefs.chart_type==='candlestick'
     series.push({name,type:candle?'candlestick':'line',xAxisIndex:0,yAxisIndex:0,
       data:dates.map(day=>{const b=byDate.get(day);return candle?(b?[b.open,b.close,b.low,b.high]:['-','-','-','-']):b?value(b.close):null}),
       showSymbol:dates.length<10,symbolSize:5,connectNulls:false,progressive:1000,
-      ...(candle?{itemStyle:{color:'#d96666',color0:'#4c9d7b',borderColor:'#d96666',borderColor0:'#4c9d7b'}}:{lineStyle:{width:1.5},color:colors[index%colors.length]})})
+      ...(candle?{itemStyle:{color:'#d96666',color0:'#4c9d7b',borderColor:'#d96666',borderColor0:'#4c9d7b'},tooltip:{formatter:(p:any)=>{
+        const bar=byDate.get(p.name),change=bar?.change_pct
+        if(!bar)return ''
+        const percent=typeof change==='number' && Number.isFinite(change)?`${change>0?'+':''}${change.toFixed(2)}%`:'暂无前收盘价'
+        return `${name}<br/>${p.name}<br/>开盘：${Number(bar.open).toFixed(2)}<br/>收盘：${Number(bar.close).toFixed(2)}<br/>最低：${Number(bar.low).toFixed(2)}<br/>最高：${Number(bar.high).toFixed(2)}<br/>${changeLabel}：${percent}`
+      }}}:{lineStyle:{width:1.5},color:colors[index%colors.length]})})
     if(prefs.ma_enabled && symbol===primary){
       for(const [i,n] of prefs.ma_periods.entries())series.push({name:`M${n}（日）`,type:'line',showSymbol:false,connectNulls:false,lineStyle:{width:1,type:'dashed',color:['#8a9385','#a58ab8','#6f9ba8','#ba9292'][i%4]},itemStyle:{color:['#8a9385','#a58ab8','#6f9ba8','#ba9292'][i%4]},xAxisIndex:0,yAxisIndex:0,data:dates.map(day=>value(byDate.get(day)?.ma?.[String(n)]))})
     }

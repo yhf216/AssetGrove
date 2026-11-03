@@ -1,4 +1,4 @@
-"""Small, resumable history ranges; repair populated dates before empty years."""
+"""Small, resumable history ranges; recent gaps precede remote history."""
 from bisect import bisect_left
 from datetime import date,timedelta
 from .market_cache import HISTORY_SOURCE
@@ -24,7 +24,7 @@ def repair_ranges(first,last):
 
 
 def history_work(store,start,end):
-    """Repair almost-complete history before wholly missing recent sessions."""
+    """Select the latest missing 90-day window, then minimize requests inside it."""
     with store.connect() as db:
         days=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(start,end))]
         universe=list(db.execute('SELECT ipo,out_date FROM universe'))
@@ -41,8 +41,15 @@ def history_work(store,start,end):
         missing.append(day)
         if counts.get(day,0)/active>=.9:nearly.append(day)
     if not missing:return start,end,[],False
-    first,last=(nearly[0],nearly[-1]) if nearly else (missing[0],missing[-1])
-    return first,last,[day for day in missing if first<=day<=last],not nearly
+    cutoff=str(date.fromisoformat(missing[-1])-timedelta(days=89))
+    recent=[day for day in missing if day>=cutoff]
+    recent_nearly=[day for day in nearly if day>=cutoff]
+    if recent_nearly:
+        # Repair recent and older sessions in one stock query where possible.
+        first=max(nearly[0],str(date.fromisoformat(recent_nearly[-1])-timedelta(days=365)))
+        last=recent_nearly[-1]
+    else:first,last=recent[0],recent[-1]
+    return first,last,[day for day in missing if first<=day<=last],not recent_nearly
 
 
 def repair_priority(store,start,end):
@@ -62,5 +69,5 @@ def repair_priority(store,start,end):
     for value in coverage:prefix.append(prefix[-1]+value)
     def score(item):
         first,last=item[0];a=bisect_left(days,first);b=bisect_left(days,last+'~')
-        return (round((prefix[b]-prefix[a])/max(1,b-a),6),last,first)
+        return (last,round((prefix[b]-prefix[a])/max(1,b-a),6),first)
     return score
