@@ -224,7 +224,7 @@ def create_app(database=None, token=None, background=True):
     @app.post('/api/market/sync',dependencies=[Depends(auth)])
     def market_sync(body:dict):
         kind=body.get('kind','indices')
-        if kind not in {'indices','history'}:raise ValueError('无效同步任务')
+        if kind not in {'indices','history','valuation','valuation_history','static_history'}:raise ValueError('无效同步任务')
         if kind=='history':
             start=iso_date(body.get('start'));end=iso_date(body.get('end'))
             from .market_jobs import last_closed_day

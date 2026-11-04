@@ -75,6 +75,9 @@ def _query(action, payload, budget=None):
     if action in {'market_reference_index','market_reference_bond'}:
         from .market_reference import query as reference_query
         return reference_query('index' if action=='market_reference_index' else 'bond',payload,now().date().isoformat())
+    if action=='market_static_history':
+        from .market_archive import query as archive_query
+        return archive_query(payload,now().date().isoformat())
     if action=='market_erp_pe':
         import akshare as ak
         frame=ak.stock_index_pe_lg(symbol='沪深300')

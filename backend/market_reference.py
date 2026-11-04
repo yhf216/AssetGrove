@@ -25,7 +25,7 @@ def bootstrap(store,today):
         files=json.loads(manifest.read_text(encoding='utf-8'))
         for key,name in [('sh000300','sh000300.csv'),('sz399986','sz399986.csv'),('bond','bond.xlsx')]:
             entry=files.get(key)
-            if not entry or store.setting('reference_seed_'+key)==entry['sha256']:continue
+            if not entry or (store.setting('reference_seed_'+key)==entry['sha256'] and store.setting('reference_quotes_seed_'+key)==entry['sha256']):continue
             path=folder/name
             if path.stat().st_size>4*1024*1024:raise ValueError('本地参考数据过大')
             body=path.read_bytes()
@@ -35,9 +35,11 @@ def bootstrap(store,today):
                 if key=='bond':save_component(db,'bond',records,today)
                 else:
                     save(db,key,records)
+                    save_quotes(db,key,records,today)
                     if key=='sh000300':save_component(db,'pe',records,today)
-            store.setting('reference_'+key,{'checked':today,'asof':max(r['date'] for r in records),'sha256':entry['sha256'],'url':BASE+(BOND_PATH if key=='bond' else INDICES[key][1])},write=True)
+            store.setting('reference_'+key,{'checked':today,'first':min(r['date'] for r in records),'count':len(records),'asof':max(r['date'] for r in records),'sha256':entry['sha256'],'url':BASE+(BOND_PATH if key=='bond' else INDICES[key][1])},write=True)
             store.setting('reference_seed_'+key,entry['sha256'],write=True)
+            store.setting('reference_quotes_seed_'+key,entry['sha256'],write=True)
         store.calculate_pending(limit=10000)
     except Exception as exc:
         store.setting('erp_error','本地参考数据未导入：'+str(exc)[:160],write=True)
@@ -55,11 +57,29 @@ def parse_index(data,symbol,today):
             if row['code'].zfill(6)!=symbol[2:] or day>today:continue
             pe,o,h,l,c=[float(row[key]) for key in ['pe_ttm','OpenPrice','HighPrice','LowPrice','close']]
             if any(not math.isfinite(v) or v<=0 for v in [pe,o,h,l,c]) or h<max(o,l,c) or l>min(o,h,c):continue
-            records[day]={'symbol':symbol,'date':day,'pe':pe,'open':o,'high':h,'low':l,'close':c,'source':PE_SOURCE}
+            record={'symbol':symbol,'date':day,'pe':pe,'open':o,'high':h,'low':l,'close':c,'source':PE_SOURCE}
+            try:
+                volume=float(row['TurnoverVolume'])
+                if math.isfinite(volume) and volume>=0:record['volume']=volume
+            except (ValueError,TypeError,KeyError):pass
+            records[day]=record
         except (ValueError,TypeError,KeyError):continue
     values=sorted(records.values(),key=lambda r:r['date'])
     if not values:raise ValueError('没有有效的指数估值历史')
     return values
+
+
+def save_quotes(db,symbol,records,today):
+    """Reuse verified CSI daily quotes; preserve every existing market bar."""
+    if symbol!='sh000300':return
+    values=[(symbol,r['date'],r['open'],r['high'],r['low'],r['close'],r['volume'],PE_SOURCE)
+            for r in records if all(k in r for k in ['open','high','low','close','volume'])]
+    count=db.executemany('INSERT OR IGNORE INTO index_bars VALUES(?,?,?,?,?,?,?,?)',values).rowcount
+    if count:
+        from .storage import now
+        old=db.execute('SELECT source FROM index_info WHERE symbol=?',(symbol,)).fetchone()
+        bounds=db.execute('SELECT MIN(date),MAX(date) FROM index_bars WHERE symbol=?',(symbol,)).fetchone()
+        db.execute('INSERT OR REPLACE INTO index_info VALUES(?,?,?,?,?)',(symbol,old[0] if old else 'CSI 静态历史补缺 / 本地缓存',*bounds,now().isoformat()))
 
 
 def parse_bond(data,today):

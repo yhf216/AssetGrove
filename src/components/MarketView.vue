@@ -7,7 +7,7 @@ import IndicatorGuide from './IndicatorGuide.vue'
 import ValuationChart from './ValuationChart.vue'
 
 const state=ref<any>(null),history=ref<any>(null),error=ref(''),busy=ref(false),refreshing=ref(false),maText=ref('10,20,50,250')
-const prefs=reactive<any>({symbols:['sh000001'],period:'d',chart_type:'candlestick',ma_enabled:false,ma_periods:[10,20,50,250],volume_enabled:true,trin_enabled:false,erp_enabled:false,normalize:true,indicator_period:'w',valuation_enabled:false,valuation_symbol:'sh000300',valuation_years:10})
+const prefs=reactive<any>({symbols:['sh000001'],period:'d',chart_type:'candlestick',ma_enabled:false,ma_periods:[10,20,50,250],volume_enabled:true,trin_enabled:false,erp_enabled:false,normalize:true,indicator_period:'w',valuation_enabled:true,valuation_symbol:'sh000300',valuation_years:10})
 let timer:ReturnType<typeof setInterval>,lastRevision=-1,lastCalculation=0,loaded=false,disposed=false,request=0,saveVersion=0
 let polling:Promise<void>|null=null
 let saveQueue=Promise.resolve()
@@ -44,9 +44,9 @@ async function save(){
     await saveQueue
   }catch(e:any){error.value=e.message}
 }
-async function sync(){
+async function sync(kind='indices'){
   busy.value=true;error.value=''
-  try{await api('/market/sync','POST',{kind:'indices'});await poll()}
+  try{await api('/market/sync','POST',{kind});await poll()}
   catch(e:any){error.value=e.message}
   finally{busy.value=false}
 }
@@ -70,7 +70,7 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer);document.removeEventList
     <div class="panel market-controls">
       <fieldset class="market-index-list"><legend>指数</legend><label v-for="index in state?.catalog || []" :key="index.symbol" class="checkbox-label"><input v-model="prefs.symbols" type="checkbox" :value="index.symbol" @change="save" />{{ index.name }}</label></fieldset>
       <div class="market-options"><label>图形<select v-model="prefs.chart_type" aria-label="图形" @change="save"><option value="candlestick" :disabled="prefs.symbols.length>1">K 线</option><option value="line">收盘折线</option></select></label><label class="checkbox-label"><input v-model="prefs.ma_enabled" type="checkbox" @change="save" />均线（主指数）</label><label v-if="prefs.ma_enabled">日均线周期<input v-model="maText" aria-label="日均线周期" placeholder="10,20,50,250" @change="save" /></label><label class="checkbox-label"><input v-model="prefs.volume_enabled" type="checkbox" @change="save" />主指数成交量</label><label class="checkbox-label"><input v-model="prefs.trin_enabled" type="checkbox" @change="save" />TRIN</label><label class="checkbox-label"><input v-model="prefs.erp_enabled" type="checkbox" @change="save" />ERP</label><label v-if="prefs.symbols.length>1" class="checkbox-label"><input v-model="prefs.normalize" type="checkbox" @change="save" />共同起点归一化</label></div>
-      <div v-if="prefs.erp_enabled || prefs.valuation_enabled" class="market-longterm-options">
+      <div class="market-longterm-options">
         <label>长期指标频率<select v-model="prefs.indicator_period" aria-label="长期指标频率" @change="save"><option value="w">周频</option><option value="d">日频</option></select></label>
       </div>
     </div>
@@ -82,17 +82,18 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer);document.removeEventList
     <article class="panel market-plot"><MarketChart v-if="history" :history="history" :catalog="state?.catalog || []" /><div v-else class="empty-chart">正在读取市场缓存…</div></article>
     <div class="market-data-row"><span v-for="entry in history?.coverage?.filter((r:any)=>prefs.symbols.includes(r.symbol)) || []" :key="entry.symbol" :title="entry.source">{{ state?.catalog.find((r:any)=>r.symbol===entry.symbol)?.name }} {{ entry.first_date }} — {{ entry.last_date }}</span></div>
     <article class="panel market-valuation">
-      <div class="market-valuation-top"><h3><label class="checkbox-label"><input v-model="prefs.valuation_enabled" type="checkbox" @change="save" />PE-TTM 估值通道</label></h3><template v-if="prefs.valuation_enabled"><label>估值指数<select v-model="prefs.valuation_symbol" aria-label="估值指数" @change="save"><option v-for="entry in state?.valuation_catalog || []" :key="entry.symbol" :value="entry.symbol">{{ entry.name }}</option></select></label><label>统计区间<select v-model.number="prefs.valuation_years" aria-label="估值统计区间" @change="save"><option :value="10">近十年</option><option :value="0">全部历史</option></select></label></template></div>
-      <template v-if="prefs.valuation_enabled">
+      <div class="market-valuation-top"><h3>PE-TTM 估值通道</h3><label>估值指数<select v-model="prefs.valuation_symbol" aria-label="估值指数" @change="save"><option v-for="entry in state?.valuation_catalog || []" :key="entry.symbol" :value="entry.symbol">{{ entry.name }}</option></select></label><label>统计区间<select v-model.number="prefs.valuation_years" aria-label="估值统计区间" @change="save"><option :value="10">近十年</option><option :value="0">全部历史</option></select></label><button class="button secondary" :disabled="busy || state?.progress.running" @click="sync('valuation')">更新估值</button><button class="button secondary" :disabled="busy || state?.progress.running" title="重新下载所选指数的完整估值历史，修复本地缺漏" @click="sync('valuation_history')">补齐估值历史</button></div>
       <div v-if="history?.valuation?.statistics" class="valuation-stats"><span>PE-TTM <strong>{{ Number(history.valuation.statistics.latest).toFixed(2) }} 倍</strong></span><span>历史分位 <strong>{{ Number(history.valuation.statistics.percentile).toFixed(1) }}%</strong></span><span>均值 {{ Number(history.valuation.statistics.mean).toFixed(2) }} 倍 · σ {{ Number(history.valuation.statistics.std).toFixed(2) }}</span><span>P10 {{ Number(history.valuation.statistics.p10).toFixed(2) }} · P50 {{ Number(history.valuation.statistics.p50).toFixed(2) }} · P90 {{ Number(history.valuation.statistics.p90).toFixed(2) }}</span></div>
       <ValuationChart v-if="history?.valuation?.statistics" :valuation="history.valuation" />
-      <p v-else>等待后台读取指数的十年以上估值历史，可手动更新市场数据。</p>
+      <p v-else>暂无估值历史，点击“补齐估值历史”获取。</p>
+      <p v-if="state?.valuation_error" class="market-error" role="status">{{ state.valuation_error }}</p>
+      <div v-if="state?.valuation_status?.checked" class="market-data-row"><span>最近检查 {{ state.valuation_status.checked }}</span><span v-if="state.valuation_status.asof">源数据截至 {{ state.valuation_status.asof }}</span></div>
       <div v-if="history?.valuation?.coverage" class="market-data-row"><span>{{ history.valuation.name }} · {{ history.valuation.coverage.first }} — {{ history.valuation.coverage.last }}</span><span>{{ history.valuation.coverage.count }} 个日度观测 · {{ prefs.indicator_period==='w'?'周频显示':'日频显示' }}</span><span v-if="!history.valuation.coverage.ten_years">历史尚不足十年，等待补齐</span><a :href="history.valuation.source_url" target="_blank" rel="noreferrer">数据来源</a></div>
-      </template>
     </article>
     <div v-if="prefs.trin_enabled" class="panel market-trin-info"><div><strong>TRIN · 沪深 A 股 <b v-if="state?.latest_trin">{{ Number(state.latest_trin.value).toFixed(3) }}</b></strong><span v-if="state?.latest_trin">最新日值 {{ state.latest_trin.date }} · {{ state.latest_trin.provisional ? '盘中值' : '收盘值' }} · 上涨 {{ state.latest_trin.advances }} 家 / 下跌 {{ state.latest_trin.declines }} 家</span><span>{{ state?.trin_coverage.count || 0 }} 个有效交易日<span v-if="state?.trin_coverage.first"> · {{ state.trin_coverage.first }} — {{ state.trin_coverage.last }}</span></span></div></div>
     <div v-if="prefs.erp_enabled" class="panel market-trin-info"><div><strong>ERP · 沪深300{{ history?.erp_frequency==='monthly' ? '（月频）' : history?.erp_frequency==='weekly' ? '（周频）' : '（日频）' }} <b v-if="state?.latest_erp">{{ Number(state.latest_erp.value).toFixed(2) }} 个百分点</b></strong><span>100 ÷ 滚动市盈率 − 中国10年期国债收益率</span><span v-if="state?.latest_erp">{{ state.latest_erp.date }} · PE {{ Number(state.latest_erp.pe).toFixed(2) }} · 国债 {{ Number(state.latest_erp.bond_yield).toFixed(2) }}%</span><span v-else>等待后台读取估值和国债历史</span><span>{{ state?.erp_coverage?.count || 0 }} 个日度观测<span v-if="history?.erp_statistics"> · 历史分位 {{ Number(history.erp_statistics.percentile).toFixed(1) }}%</span></span><span v-if="state?.erp_error" class="market-error">{{ state.erp_error }}</span></div></div>
     <div class="panel market-cache-status">
+      <details class="market-static-history"><summary>个股历史补充数据</summary><div class="market-data-row"><span>沪深未复权静态快照 · 2010—2026-09-24 · 首次下载约 885 MB，之后复用本地文件</span><button class="button secondary" :disabled="busy || state?.progress.running" @click="sync('static_history')">下载并补齐个股历史</button><a href="https://github.com/noblechang/a-share-data/releases/tag/FREE_DATA_v0" target="_blank" rel="noreferrer">数据来源</a></div><div v-if="state?.static_history" class="market-data-row"><span>最近导入 {{ state.static_history.checked }} · 新增 {{ state.static_history.imported }} 条 · 已有数据保留</span></div></details>
       <div class="market-data-row"><label class="checkbox-label"><input type="checkbox" :checked="state?.background?.enabled ?? true" @change="background(($event.target as HTMLInputElement).checked)" />自动回补指标历史</label><span v-if="state?.background?.plan">{{ state.background.plan.start }} — {{ state.background.plan.end }}</span><span v-if="state?.history_pending?.count">待补齐 {{ state.history_pending.count }} 个交易日<span v-if="state.history_pending.latest"> · {{ state.history_pending.latest.date }} 样本完整度 {{ (state.history_pending.latest.coverage*100).toFixed(2) }}%</span></span></div>
       <div v-if="state?.network" class="market-data-row"><span>今日自动请求 {{ state.network.automatic_used }} / {{ state.network.automatic_limit }} · 历史回补 {{ state.network.history_used }} / {{ state.network.history_limit }} · 含手动 {{ state.network.used }} / {{ state.network.limit }}</span><span v-if="state.network.retry_at>Date.now()/1000">{{ state.network.message }} · {{ new Date(state.network.retry_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) }}</span></div>
     </div>

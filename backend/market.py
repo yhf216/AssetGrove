@@ -31,7 +31,7 @@ INDICES = [
 SYMBOLS = {r['symbol'] for r in INDICES}
 DEFAULT_PREFS = {'symbols':['sh000001'],'period':'d','chart_type':'candlestick','ma_enabled':False,
                  'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True,
-                 'indicator_period':'w','valuation_enabled':False,'valuation_symbol':'sh000300','valuation_years':10}
+                 'indicator_period':'w','valuation_enabled':True,'valuation_symbol':'sh000300','valuation_years':10}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(symbol,date));
@@ -210,7 +210,7 @@ class MarketStore:
     def index_ranges(self,symbol,target,refresh=False):
         with self.connect() as db:
             info=db.execute('SELECT * FROM index_info WHERE symbol=?',(symbol,)).fetchone()
-            if not info:return [('1990-01-01',target)]
+            if not info or info['source']=='CSI 静态历史补缺 / 本地缓存':return [('1990-01-01',target)]
             goal=info['last_date'] if refresh and info['last_date']==now().date().isoformat() else target
             days=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 AND date BETWEEN ? AND ? ORDER BY date',(info['first_date'],goal))]
             present={r[0] for r in db.execute('SELECT date FROM index_bars WHERE symbol=? AND date BETWEEN ? AND ?',(symbol,info['first_date'],goal))}
@@ -268,10 +268,12 @@ class MarketStore:
                 if type(prefs['valuation_years']) is not int or prefs['valuation_years'] not in {0,10}:raise ValueError('估值统计请选择近十年或全部历史')
                 for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize']:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
+                prefs['valuation_enabled']=True
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
                 if prefs['erp_enabled']:db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['trin_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            prefs['valuation_enabled']=True # Compatibility with saved preferences from older versions.
             return prefs
 
     def save_index(self,symbol,result):
@@ -426,6 +428,9 @@ class MarketService:
                 'history_pending':{'count':pending,'latest':dict(gap) if gap else None},
                 'erp_coverage':{'count':erp_stats[0],'first':erp_stats[1],'last':erp_stats[2]},'latest_erp':dict(latest_erp) if latest_erp else None,'erp_error':self.store.setting('erp_error',default=''),
                 'valuation_catalog':[{'symbol':symbol,'name':entry[0]} for symbol,entry in VALUATION_INDICES.items()],
+                'valuation_status':self.store.setting('reference_'+self.store.preferences()['valuation_symbol'],default={}),
+                'valuation_error':self.store.setting('valuation_error_'+self.store.preferences()['valuation_symbol'],default=''),
+                'static_history':self.store.setting('static_history',default=None),
                 'network':{**self.network.status(),'message':self.store.setting('market_network_message',default=''),'retry_at':self.store.setting('market_network_retry',default=0)},
                 'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':' / '.join(TIMES),'error':self.store.setting('background_error',default='')}}
 
@@ -460,6 +465,19 @@ class MarketService:
                     result=self.backfill(start,end,budget=budget)
                     if not self.cancel.is_set():self.scheduler.completed(start,end,result)
                 elif kind=='erp':self.sync_erp(history=True)
+                elif kind in {'valuation','valuation_history'}:self.sync_erp(valuation_only=True,repair=kind=='valuation_history')
+                elif kind=='static_history':
+                    with self.store.connect() as db:count=db.execute('SELECT COUNT(*) FROM universe').fetchone()[0]
+                    if count<3000:
+                        self.update(phase='同步沪深证券目录')
+                        result=self.request_with_backup('market_universe','market_universe_ak',{},timeout=240)
+                        if not result['ok']:raise ValueError(result.get('error','证券目录暂不可用'))
+                        self.store.replace_universe(result['data'])
+                    self.update(phase='下载并校验个股静态历史（约 885 MB），随后填补本地缺口')
+                    result=self.request('market_static_history',{},timeout=3600)
+                    if not result['ok']:raise ValueError(result.get('error','静态历史暂不可用'))
+                    self.store.setting('static_history',{**result['data'],'checked':now().date().isoformat()},write=True)
+                    self.store.calculate_pending(cancel=self.cancel,limit=10000)
                 else:
                     self.sync_indices()
                     self.sync_erp()
@@ -483,26 +501,29 @@ class MarketService:
         self.thread.start()
         return True
 
-    def sync_erp(self,history=False):
-        erp_requested=self.store.setting('erp_requested',default=False)
-        valuation_requested=self.store.setting('valuation_requested',default=False)
-        if not (erp_requested or valuation_requested) or self.cancel.is_set():return
+    def sync_erp(self,history=False,valuation_only=False,repair=False):
+        erp_requested=not valuation_only and self.store.setting('erp_requested',default=False)
+        if self.cancel.is_set():return
         from .market_jobs import last_closed_day
         target=date.fromisoformat(last_closed_day(self.store))
         friday=(target-timedelta(days=(target.weekday()-4)%7)).isoformat()
         today=now().date().isoformat();symbols=set()
         if erp_requested:symbols.add('sh000300')
-        if valuation_requested:symbols.add(self.store.preferences()['valuation_symbol'])
+        symbols.add(self.store.preferences()['valuation_symbol'])
         tasks=[('index',symbol) for symbol in sorted(symbols)]
         if erp_requested:tasks.append(('bond','bond'))
         errors=[];attempted=False
         for kind,key in tasks:
             if self.cancel.is_set():return
             stamp=self.store.setting('reference_'+key,default={})
-            if not self.manual and (stamp.get('asof','')>=friday or stamp.get('checked')==today):continue
+            with self.store.connect() as db:
+                if kind=='index':bounds=db.execute('SELECT MIN(date),MAX(date),COUNT(*) FROM valuation_bars WHERE symbol=?',(key,)).fetchone()
+                else:bounds=db.execute('SELECT MIN(date),MAX(date),COUNT(*) FROM erp_bond').fetchone()
+            reusable=bool(bounds[0] and bounds[1]==stamp.get('asof') and bounds[2]==stamp.get('count') and bounds[0]==stamp.get('first'))
+            if not self.manual and (stamp.get('checked')==today or (reusable and stamp.get('asof','')>=friday)):continue
             attempted=True
             self.store.setting('reference_'+key,{**stamp,'checked':today},write=True)
-            payload={'etag':stamp.get('etag')}
+            payload={'etag':stamp.get('etag') if reusable and not repair else None}
             if kind=='index':payload['symbol']=key
             self.update(phase='同步长期指标静态历史：'+(VALUATION_INDICES[key][0] if kind=='index' else '十年国债'))
             try:response=self.request('market_reference_'+kind,payload,timeout=120)
@@ -510,19 +531,25 @@ class MarketService:
                 if not exc.source:raise
                 response={'ok':False,'error':str(exc)}
             if not response['ok']:
-                errors.append(response.get('error','参考数据暂不可用'));continue
+                message=response.get('error','参考数据暂不可用');errors.append(message)
+                if kind=='index':self.store.setting('valuation_error_'+key,message,write=True)
+                continue
             data=response['data']
             if data.get('unchanged'):
-                if not stamp.get('asof'):errors.append('本地没有可复用的参考数据');continue
+                if not reusable:errors.append('本地历史不完整，请补齐估值历史');continue
                 self.store.setting('reference_'+key,{**stamp,'checked':today,'etag':data.get('etag') or stamp.get('etag')},write=True)
+                if kind=='index':self.store.setting('valuation_error_'+key,'',write=True)
                 continue
             records=data['records']
             with self.store.connect() as db:
                 if kind=='index':
                     save_valuation(db,key,records)
+                    from .market_reference import save_quotes
+                    save_quotes(db,key,records,today)
                     if key=='sh000300':save_component(db,'pe',records,today)
                 else:save_component(db,'bond',records,today)
-            self.store.setting('reference_'+key,{'checked':today,'asof':max(r['date'] for r in records),'etag':data.get('etag'),'sha256':data.get('sha256'),'url':data.get('url')},write=True)
+            self.store.setting('reference_'+key,{'checked':today,'first':min(r['date'] for r in records),'count':len(records),'asof':max(r['date'] for r in records),'etag':data.get('etag'),'sha256':data.get('sha256'),'url':data.get('url')},write=True)
+            if kind=='index':self.store.setting('valuation_error_'+key,'',write=True)
             self.store.calculate_pending(cancel=self.cancel,limit=10000)
         if attempted:self.store.setting('erp_error','；'.join(errors),write=True)
 
