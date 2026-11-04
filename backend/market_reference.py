@@ -25,19 +25,23 @@ def bootstrap(store,today):
         files=json.loads(manifest.read_text(encoding='utf-8'))
         for key,name in [('sh000300','sh000300.csv'),('sz399986','sz399986.csv'),('bond','bond.xlsx')]:
             entry=files.get(key)
-            if not entry or (store.setting('reference_seed_'+key)==entry['sha256'] and store.setting('reference_quotes_seed_'+key)==entry['sha256']):continue
+            if not entry:continue
+            imported=store.setting('reference_seed_'+key)==entry['sha256']
+            if imported and store.setting('reference_quotes_seed_'+key)==entry['sha256']:continue
             path=folder/name
             if path.stat().st_size>4*1024*1024:raise ValueError('本地参考数据过大')
             body=path.read_bytes()
             if hashlib.sha256(body).hexdigest()!=entry['sha256']:raise ValueError('本地参考数据校验失败')
             records=parse_bond(body,today) if key=='bond' else parse_index(body,key,today)
             with store.connect() as db:
-                if key=='bond':save_component(db,'bond',records,today)
+                if key=='bond':
+                    if not imported:save_component(db,'bond',records,today)
                 else:
-                    save(db,key,records)
                     save_quotes(db,key,records,today)
-                    if key=='sh000300':save_component(db,'pe',records,today)
-            store.setting('reference_'+key,{'checked':today,'first':min(r['date'] for r in records),'count':len(records),'asof':max(r['date'] for r in records),'sha256':entry['sha256'],'url':BASE+(BOND_PATH if key=='bond' else INDICES[key][1])},write=True)
+                    if not imported:
+                        save(db,key,records)
+                        if key=='sh000300':save_component(db,'pe',records,today)
+            if not imported:store.setting('reference_'+key,{'checked':today,'first':min(r['date'] for r in records),'count':len(records),'asof':max(r['date'] for r in records),'sha256':entry['sha256'],'url':BASE+(BOND_PATH if key=='bond' else INDICES[key][1])},write=True)
             store.setting('reference_seed_'+key,entry['sha256'],write=True)
             store.setting('reference_quotes_seed_'+key,entry['sha256'],write=True)
         store.calculate_pending(limit=10000)
