@@ -217,6 +217,10 @@ def create_app(database=None, token=None, background=True):
     def market_preferences(body:dict):
         return market.store.preferences(body)
 
+    @app.post('/api/market/recalculate',dependencies=[Depends(auth)])
+    def market_recalculate():
+        return market.scheduler.refresh()
+
     @app.post('/api/market/sync',dependencies=[Depends(auth)])
     def market_sync(body:dict):
         kind=body.get('kind','indices')

@@ -5,6 +5,15 @@ import math
 HISTORY_SOURCE='历史全市场 / BaoStock、AKShare'
 
 
+def enqueue_cached(db,force=False):
+    """Recover orphaned cached inputs without contacting any data source."""
+    clause='' if force else ' EXCEPT SELECT date FROM trin WHERE value IS NOT NULL'
+    db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'trin',date FROM (SELECT DISTINCT date FROM breadth"+clause+')')
+    clause='' if force else ' WHERE e.date IS NULL OR e.pe IS NOT p.pe OR e.bond_yield IS NOT b.yield10 OR e.pe_source IS NOT p.source OR e.bond_source IS NOT b.source'
+    db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'erp',p.date FROM erp_pe p JOIN erp_bond b ON b.date=p.date LEFT JOIN erp e ON e.date=p.date"+clause)
+    if force:db.execute('UPDATE indicator_dirty SET not_before=0')
+
+
 def save_breadth(db,records,allowed,start,end):
     values=[];allowed=set(allowed)
     for row in records:

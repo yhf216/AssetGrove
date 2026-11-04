@@ -13,7 +13,7 @@ import time
 
 from .providers import fetch
 from .storage import now, rows
-from .market_cache import install_cache, calculate_trin, save_breadth
+from .market_cache import install_cache, calculate_trin, save_breadth, enqueue_cached
 from .market_history import repair_ranges, repair_priority, history_work
 from .market_network import MarketBudget, MarketLimit
 from .sync_schedule import TIMES
@@ -170,6 +170,14 @@ class MarketStore:
             clause='' if changed_inputs else ' AND t.value IS NULL'
             db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'trin',b.date FROM breadth b LEFT JOIN trin t ON t.date=b.date WHERE b.date BETWEEN ? AND ?"+clause+' GROUP BY b.date',(start,end))
 
+    def recover_calculations(self,force=False):
+        with self.connect() as db:enqueue_cached(db,force)
+
+    def trin_requested(self):
+        if self.setting('trin_requested',default=False) or self.preferences()['trin_enabled']:return True
+        with self.connect() as db:
+            return bool(db.execute('SELECT 1 FROM trin LIMIT 1').fetchone() or db.execute('SELECT 1 FROM breadth LIMIT 1').fetchone())
+
     def replace_universe(self,records):
         values=[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in records]
         with self.connect() as db:
@@ -262,6 +270,7 @@ class MarketStore:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
                 if prefs['erp_enabled']:db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if prefs['trin_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             return prefs
 
@@ -351,7 +360,7 @@ class MarketService:
     def __init__(self,store):
         self.store=store;self.lock=threading.Lock();self.cancel=threading.Event()
         self.progress={'running':False,'phase':'','done':0,'total':0,'errors':[],'revision':0}
-        self.calculation={'running':False,'done':0,'total':0,'error':''}
+        self.calculation={'running':False,'done':0,'total':0,'error':'','requested':0,'completed':0}
         self.calculation_cancel=threading.Event()
         self.thread=None;self.request_interval=1.5;self.last_request=0
         self.index_refresh=False;self.index_target=None
@@ -362,6 +371,7 @@ class MarketService:
 
     def shutdown(self):
         self.scheduler.stop.set()
+        self.scheduler.calculation_wakeup.set()
         self.cancel.set()
         self.calculation_cancel.set()
         deadline=time.monotonic()+2
@@ -383,7 +393,7 @@ class MarketService:
         if self.cancel.wait(max(0,self.request_interval-(time.monotonic()-self.last_request))):
             return {'ok':False,'cancelled':True,'error':'同步已停止'}
         self.last_request=time.monotonic()
-        scope='history' if self.progress.get('kind') in {'history','erp'} or action in {'market_breadth_batch','market_breadth_stock_ak'} else 'daily'
+        scope='history' if self.progress.get('kind') in {'history','erp'} else 'daily'
         result=fetch(action,{**payload,'_market_cache':str(self.store.path),'_market_scope':scope,'_market_manual':self.manual},timeout=timeout,cancel=self.cancel)
         if result.get('limited'):raise MarketLimit(result['error'],result['retry_at'],result.get('source',''))
         return result
@@ -543,10 +553,19 @@ class MarketService:
                 else:
                     with self.lock:self.progress['errors'].append(index['name']+'：'+'；'.join(errors))
         if self.cancel.is_set():return
-        with self.store.connect() as db:
-            cached=db.execute('SELECT date FROM trin WHERE date>=? AND value IS NOT NULL AND provisional=0 ORDER BY date DESC LIMIT 1',(target,)).fetchone()
-        if cached and (not self.index_refresh or cached['date']>=now().date().isoformat()):
+        if not self.store.trin_requested():
             self.update(done=len(indices)+1);return
+        closed=target<now().date().isoformat() or now().strftime('%H:%M')>='15:10'
+        self.store.enqueue_calculations(target,target)
+        self.store.calculate_pending(cancel=self.cancel,start=target,end=target)
+        with self.store.connect() as db:
+            cached=db.execute('SELECT date FROM trin WHERE date=? AND value IS NOT NULL AND provisional=0',(target,)).fetchone()
+        if cached and (closed or not self.index_refresh):
+            self.update(done=len(indices)+1);return
+        if closed:
+            self.backfill(target,target,budget=90,kind='indices')
+            self.update(done=len(indices)+1)
+            return
         self.update(phase='同步沪深市场 TRIN',done=len(indices))
         if self.store.setting('universe_date')!=now().date().isoformat():
             universe=self.request_with_backup('market_universe','market_universe_ak',{},timeout=240)
@@ -562,8 +581,8 @@ class MarketService:
     def save_breadth(self,records,allowed,start,end):
         with self.store.connect() as db:save_breadth(db,records,allowed,start,end)
 
-    def backfill(self,start,end,budget=None):
-        self.update(kind='history')
+    def backfill(self,start,end,budget=None,kind='history'):
+        self.update(kind=kind)
         start=date.fromisoformat(start).isoformat();end=date.fromisoformat(end).isoformat()
         if start>end or start<'1990-01-01' or end>now().date().isoformat():raise ValueError('历史回补日期应在 1990 年至今天之间')
         began=time.monotonic()
@@ -618,6 +637,15 @@ class MarketService:
             if exact is not None:return exact
             inherited=[v for k,v in failures.items() if k.startswith(code+':') and k.split(':')[1]<=last and k.split(':')[2]>=first]
             return max(inherited,key=lambda v:v.get('next',0),default={})
+        daily_available=self.store.setting('history_daily_disabled_until',default=0)<=now().timestamp()
+        if daily_available:
+            _,work_missing=self.store.history_gaps(work_start,work_end)
+            eligible=[code for code in work_missing if stock_failures.get(code,{}).get('next',0)<=now().timestamp() and failure_for(code,work_start,work_end).get('next',0)<=now().timestamp()]
+            # Each eligible stock needs at least one query. Use this lower
+            # bound to avoid opening thousands of per-stock cache readers
+            # just to discover that one market-day response is cheaper.
+            if (sparse or len(eligible)>8) and len(work_days)<len(eligible):
+                return self.backfill_days(start,end,work_days,budget,began)
         plans=defaultdict(list)
         for symbol in sorted(missing):
             if stock_failures.get(symbol,{}).get('next',0)>now().timestamp():continue
@@ -625,9 +653,10 @@ class MarketService:
                 for first,last in repair_ranges(gap_start,gap_end):
                     state=failure_for(symbol,first,last)
                     if state.get('next',0)<=now().timestamp():plans[(first,last)].append(symbol)
-        # Sparse whole-market history is cheaper by day; almost-complete years
-        # are cheaper by stock. Both paths use the exact same request budget.
-        if sparse and len(work_days)<sum(map(len,plans.values())) and self.store.setting('history_daily_disabled_until',default=0)<=now().timestamp():
+        # A few stock gaps cost less data and usually less time than a full
+        # market response. For larger repairs compare query counts, not rows.
+        stock_queries=sum(map(len,plans.values()))
+        if (sparse or stock_queries>8) and len(work_days)<stock_queries and daily_available:
             return self.backfill_days(start,end,work_days,budget,began)
         exhausted=False
         deferred=None

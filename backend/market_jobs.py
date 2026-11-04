@@ -31,23 +31,45 @@ def recent_history_range(store,target):
 class MarketScheduler:
     def __init__(self,service):
         self.service=service;self.store=service.store;self.stop=threading.Event();self.thread=None;self.calculation_thread=None
+        self.calculation_wakeup=threading.Event()
 
     def start(self):
         self.thread=threading.Thread(target=self.loop,daemon=True)
         self.thread.start()
-        self.calculation_thread=threading.Thread(target=self.calculation_loop,daemon=True)
-        self.calculation_thread.start()
+        self.start_calculations()
+
+    def start_calculations(self):
+        with self.service.lock:
+            if not self.stop.is_set() and (not self.calculation_thread or not self.calculation_thread.is_alive()):
+                self.calculation_thread=threading.Thread(target=self.calculation_loop,daemon=True)
+                self.calculation_thread.start()
+
+    def refresh(self):
+        with self.service.lock:
+            state=self.service.calculation
+            if self.stop.is_set() or state['requested']>state['completed']:return {'started':False,'request':state['requested']}
+            state['requested']+=1
+            result={'started':True,'request':state['requested']}
+        self.start_calculations()
+        self.calculation_wakeup.set()
+        return result
 
     def calculation_loop(self):
-        if self.stop.wait(1):return
+        recover=True
         while not self.stop.is_set():
-            self.calculate()
-            if self.stop.wait(5):return
+            self.calculation_wakeup.clear()
+            self.calculate(recover=recover)
+            with self.service.lock:recover=bool(self.service.calculation['error'])
+            self.calculation_wakeup.wait(5)
 
-    def calculate(self):
+    def calculate(self,recover=False):
         if self.stop.is_set():return 0
-        with self.service.lock:self.service.calculation.update(running=True,done=0,total=0,error='')
+        with self.service.lock:
+            requested=self.service.calculation['requested']
+            force=requested>self.service.calculation['completed']
+            self.service.calculation.update(running=True,done=0,total=0,error='')
         try:
+            if recover or force:self.store.recover_calculations(force=force)
             def progress(done,total):
                 with self.service.lock:self.service.calculation.update(done=done,total=total)
             return self.store.calculate_pending(cancel=self.service.calculation_cancel,progress=progress)
@@ -55,7 +77,9 @@ class MarketScheduler:
             with self.service.lock:self.service.calculation['error']=str(exc)[:250]
             return 0
         finally:
-            with self.service.lock:self.service.calculation['running']=False
+            with self.service.lock:
+                self.service.calculation['running']=False
+                if force:self.service.calculation['completed']=requested
 
     def loop(self):
         while not self.stop.wait(20):
@@ -86,6 +110,7 @@ class MarketScheduler:
             self.store.setting('erp_history_attempt',today,write=True)
             self.service.start('erp',managed=True)
             return
+        if not self.store.trin_requested():return
         target=last_closed_day(self.store,moment)
         plan=self.store.setting('history_plan')
         if not plan:
