@@ -3,11 +3,12 @@ import re
 import time
 from datetime import timedelta
 from decimal import Decimal
-from contextlib import contextmanager
+from contextlib import contextmanager,nullcontext
 
 from .storage import now
 from .bao_transport import BaoTransportError, safe_baostock_transport
 from .market_network import MarketBudget, MarketLimit
+from .source_policy import source_key
 
 
 def _records(frame):
@@ -29,24 +30,17 @@ def paced_http(budget=None):
     def send(session,prepared,**kwargs):
         from urllib.parse import urlsplit
         host=(urlsplit(prepared.url).hostname or '').lower()
-        source='eastmoney' if 'eastmoney.com' in host else 'sina' if 'sina' in host else host
+        source=source_key(host)
         budget.reserve(source)
         try:
             response=original_send(session,prepared,**kwargs)
         except MarketLimit:raise
         except Exception as exc:
             budget.outcome(source,exc);raise
-        if response.status_code in {403,429}:
-            from email.utils import parsedate_to_datetime
-            retry=response.headers.get('Retry-After','0')
-            try:retry=float(retry)
-            except ValueError:
-                try:retry=max(0,parsedate_to_datetime(retry).timestamp()-now().timestamp())
-                except (ValueError,TypeError,OverflowError):retry=0
-            budget.outcome(source,'HTTP '+str(response.status_code),blocked=True,retry_after=retry)
-            response.close()
-            raise MarketLimit('数据源拒绝或限制访问，暂停该源至少 24 小时',now().timestamp()+max(86400,retry),source)
-        budget.outcome(source,None if response.status_code<500 else 'HTTP '+str(response.status_code))
+        wire=next((r for r in getattr(response,'history',[]) if getattr(getattr(r,'request',None),'url',None)==prepared.url),response)
+        try:budget.inspect_response(source,wire.status_code,wire.headers)
+        except MarketLimit:
+            response.close();raise
         return response
     if budget:requests.sessions.Session.send=send
     else:requests.sessions.Session.request=request
@@ -156,17 +150,20 @@ def _query(action, payload, budget=None):
     if action in {'market_universe','market_breadth_batch','market_breadth_days','market_calendar'}:
         import baostock as bs
         def consume(result):
+            if budget:budget.check_baostock(result)
             if result.error_code!='0':
                 raise ValueError(result.error_msg)
             values=[]
             while result.next():
                 values.append(dict(zip(result.fields,result.get_row_data())))
+            if budget:budget.check_baostock(result)
             if result.error_code!='0':raise ValueError(result.error_msg or '历史分页查询失败')
             return values
         transport_options={'timeout':60} if action=='market_breadth_days' else {}
         transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error),**transport_options) if budget else safe_baostock_transport(**transport_options)
-        with transport:
+        with (budget.baostock_session() if budget else nullcontext()),transport:
             login=bs.login()
+            if budget:budget.check_baostock(login)
             if login.error_code!='0':
                 raise ValueError(login.error_msg)
             try:

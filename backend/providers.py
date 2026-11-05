@@ -45,7 +45,7 @@ def _worker(pipe, action, payload):
                     for attempt in range(1 if budget else 2):
                         try:
                             transport=safe_baostock_transport(before_request=lambda:budget.reserve('baostock'),outcome=lambda error:budget.outcome('baostock',error)) if budget else safe_baostock_transport()
-                            with transport:
+                            with (budget.baostock_session() if budget else contextlib.nullcontext()),transport:
                                 result = _fetch(action, payload)
                             break
                         except BaoTransportError:
@@ -197,15 +197,21 @@ def _fetch(action, payload):
     code = market_prefix(symbol) + '.' + symbol
     if action.startswith('bao_'):
         import baostock as bs
+        from .market_network import MarketBudget
+        budget=MarketBudget(payload['_market_cache'],'daily',payload.get('_market_manual',False)) if payload.get('_market_cache') else None
         login = bs.login()
+        if budget:budget.check_baostock(login)
         if login.error_code != '0':
             raise RuntimeError(login.error_msg)
         def consume(result):
+            if budget:budget.check_baostock(result)
             if result.error_code != '0':
                 raise RuntimeError(result.error_msg)
             result_rows = []
             while result.next():
                 result_rows.append(dict(zip(result.fields, result.get_row_data())))
+            if budget:budget.check_baostock(result)
+            if result.error_code!='0':raise RuntimeError(result.error_msg or '历史分页查询失败')
             return result_rows
         try:
             if action == 'bao_catalog':

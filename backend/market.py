@@ -492,7 +492,8 @@ class MarketService:
                         self.store.setting('daily_success',daily_target,write=True)
                         self.store.setting('daily_retry_at',0,write=True)
             except MarketLimit as exc:
-                self.store.setting('history_next_at',exc.retry_at,write=True)
+                self.store.setting('history_next_at',min(exc.retry_at,now().timestamp()+60) if exc.source else exc.retry_at,write=True)
+                if kind=='static_history':self.store.setting('static_history_next_at',exc.retry_at,write=True)
                 self.store.setting('market_network_retry',exc.retry_at,write=True)
                 self.store.setting('market_network_message',str(exc),write=True)
                 self.update(phase=str(exc))
