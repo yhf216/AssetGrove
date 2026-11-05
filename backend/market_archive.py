@@ -167,7 +167,7 @@ def query(payload,today):
                         stream.write(chunk)
                         if time.monotonic()-reported>=5:
                             stream.flush();progress(cache,{'phase':'download','pending':True,'completed':False,'downloaded':count,'message':'正在下载，可断点续传'});reported=time.monotonic()
-                        if time.monotonic()-began>=DOWNLOAD_SECONDS:
+                        if count<SIZE and time.monotonic()-began>=DOWNLOAD_SECONDS:
                             stream.flush();return pending('本轮下载已暂停，下次从当前进度继续')
                 if count<SIZE:return pending('下载中断，进度已保留，可继续下载')
                 with part.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
