@@ -91,7 +91,14 @@ class MarketScheduler:
 
     def tick(self,moment=None):
         moment=moment or now()
-        if self.service.state()['progress']['running']:return
+        closing=self.pending_closing(moment)
+        if self.service.progress['running']:
+            if closing and self.service.job_kind in {'history','erp','static_history','valuation_history'}:
+                self.service.cancel.set()
+            return
+        if closing:
+            self.service.start('closing',daily_target=closing,managed=True)
+            return
         today=moment.date().isoformat()
         with self.store.connect() as db:trading=db.execute('SELECT trading FROM calendar WHERE date=?',(today,)).fetchone()
         slot=automatic_slot(moment,trading[0] if trading else None)
@@ -138,6 +145,18 @@ class MarketScheduler:
                 if repair[0]:plan={'start':repair[0],'end':repair[1]}
         if recent:plan=recent
         self.service.start('history',plan['start'],plan['end'],budget=300,managed=True)
+
+    def pending_closing(self,moment):
+        from .market_closing import targets,status,record
+        if self.store.setting('closing_pause_until',default=0)>moment.timestamp():return None
+        retries=self.store.setting('closing_retries',default={})
+        for day in targets(self.store,moment):
+            if status(self.store,day)['complete']:
+                if day in retries or day>self.store.setting('closing_success',default=''):record(self.service,day)
+                continue
+            if retries.get(day,{}).get('next_at',0)>moment.timestamp():continue
+            return day
+        return None
 
     def completed(self,start,end,result):
         if not result:return

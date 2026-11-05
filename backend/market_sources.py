@@ -137,17 +137,22 @@ def _query(action, payload, budget=None):
         from .quote_batch import read_quotes
         symbols=payload.get('symbols',[])
         if len(set(symbols))<3000:raise ValueError('证券目录不完整，保留已缓存的 TRIN')
-        quotes=read_quotes(['sh000001','sz399001',*symbols])
+        if payload.get('target'):
+            quotes=read_quotes(['sh000001','sz399001'])
+            if any(not quotes.get(code) or quotes[code]['date']!=payload['target'] for code in ['sh000001','sz399001']):raise ValueError('快照尚未提供待补齐日期的数据')
+            quotes.update(read_quotes(symbols))
+        else:quotes=read_quotes(['sh000001','sz399001',*symbols])
         anchors=[quotes.get(code) for code in ['sh000001','sz399001']]
         if not all(anchors) or anchors[0]['date']!=anchors[1]['date']:raise ValueError('无法核实沪深快照日期')
         day=anchors[0]['date']
+        if payload.get('target') and day!=payload['target']:raise ValueError('快照日期与待补齐日期不一致')
         records=[]
         for code in symbols:
             quote=quotes.get(code)
             if not quote or not quote['timestamp_verified'] or quote['date']!=day:raise ValueError('批量快照样本未齐，保留已缓存的 TRIN')
             records.append({'symbol':code,'change':quote['change'],'volume':quote['volume'],'trading':int(Decimal(quote['price'])>0)})
         return {'source':'新浪财经 / 批量行情','date':day,'received_at':now().isoformat(),'provisional':day==now().date().isoformat() and now().strftime('%H:%M')<'15:10','stocks':records}
-    if action in {'market_universe','market_breadth_batch','market_breadth_days','market_calendar'}:
+    if action in {'market_universe','market_breadth_batch','market_breadth_days','market_calendar','market_index_bao'}:
         import baostock as bs
         def consume(result):
             if budget:budget.check_baostock(result)
@@ -167,6 +172,11 @@ def _query(action, payload, budget=None):
             if login.error_code!='0':
                 raise ValueError(login.error_msg)
             try:
+                if action=='market_index_bao':
+                    symbol=payload['symbol']
+                    values=consume(bs.query_history_k_data_plus(symbol[:2]+'.'+symbol[2:],'date,code,open,high,low,close,volume',start_date=payload['start'],end_date=payload['end'],frequency='d',adjustflag='3'))
+                    if not values:raise ValueError('指数日线尚未发布或响应为空')
+                    return {'source':'BaoStock / 指数日线','volume_unit':'股','bars':[{'date':r['date'],**{key:float(r[key]) for key in ['open','high','low','close','volume']}} for r in values]}
                 if action=='market_universe':
                     return [r for r in consume(bs.query_stock_basic()) if r.get('type')=='1' and re.fullmatch(r'(sh\.(60|68)|sz\.(00|30))\d{4}',r['code'])]
                 if action=='market_calendar':

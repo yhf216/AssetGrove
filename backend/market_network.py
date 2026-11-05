@@ -12,15 +12,16 @@ from email.utils import parsedate_to_datetime
 from .storage import now
 from .source_policy import source_key,policy
 
-INTERVAL = 5.0
-DAILY_LIMIT = 180
-AUTOMATIC_DAILY_LIMIT = 140
-HOURLY_LIMIT = 80
-HISTORY_DAILY_LIMIT = 120
+INTERVAL = .25
+DAILY_LIMIT = 40000
+AUTOMATIC_DAILY_LIMIT = 35000
+HOURLY_LIMIT = 2000
+HISTORY_DAILY_LIMIT = 25000
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS market_requests(at REAL NOT NULL,scope TEXT NOT NULL,source TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS market_requests_at ON market_requests(at);
+CREATE INDEX IF NOT EXISTS market_requests_source_at ON market_requests(source,at);
 CREATE TABLE IF NOT EXISTS market_circuits(source TEXT PRIMARY KEY,failures INTEGER NOT NULL DEFAULT 0,until REAL NOT NULL DEFAULT 0);
 '''
 
@@ -47,15 +48,15 @@ class MarketBudget:
                         failures=MAX(market_circuits.failures,excluded.failures),until=MAX(market_circuits.until,excluded.until)''',(key,*previous))
                     db.execute('DELETE FROM market_circuits WHERE source=?',(old,))
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone():
-                migrated=db.execute("SELECT 1 FROM meta WHERE key='source_policy_version'").fetchone()
+                migrated=db.execute("SELECT 1 FROM meta WHERE key='source_policy_version' AND value='2'").fetchone()
                 if not migrated:
                     values={k:json.loads(v) for k,v in db.execute("SELECT key,value FROM meta WHERE key IN ('market_network_message','market_network_retry','history_next_at')")}
-                    if values.get('market_network_message') in {'已达今日市场请求预算，明日自动继续','已达每小时市场请求预算，稍后自动继续'}:
+                    if values.get('market_network_message') in {'已达今日市场请求预算，明日自动继续','已达每小时市场请求预算，稍后自动继续','BaoStock今日同步已暂停，明日继续','BaoStock同步已暂缓，稍后继续'}:
                         retry=values.get('market_network_retry',0)
                         keys=['market_network_retry','market_network_message']
                         if values.get('history_next_at')==retry:keys.append('history_next_at')
                         for key in keys:db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,json.dumps('' if key=='market_network_message' else 0)))
-                    db.execute("INSERT INTO meta VALUES('source_policy_version','1')")
+                    db.execute("INSERT INTO meta VALUES('source_policy_version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
 
     @contextmanager
     def connect(self):
@@ -82,8 +83,10 @@ class MarketBudget:
                 if count>=HOURLY_LIMIT:raise MarketLimit('已达每小时市场请求预算，稍后自动继续',first+3600.01)
                 used=db.execute('SELECT COUNT(*) FROM market_requests WHERE source=? AND at>=?',(source,midnight.timestamp())).fetchone()[0]
                 if used>=limits.daily:raise MarketLimit(limits.name+'今日同步已暂停，明日继续',tomorrow,source)
+                if source=='baostock' and self.scope.split(':')[-1]!='closing' and used>=20000:raise MarketLimit('已为收盘数据预留同步额度，其他任务明日继续',tomorrow,source)
                 source_count,source_first,source_last=db.execute('SELECT COUNT(*),MIN(at),MAX(at) FROM market_requests WHERE source=? AND at>?',(source,stamp-3600)).fetchone()
                 if source_count>=limits.hourly:raise MarketLimit(limits.name+'同步已暂缓，稍后继续',source_first+3600.01,source)
+                if source=='baostock' and self.scope.split(':')[-1]!='closing' and source_count>=1200:raise MarketLimit('已为收盘数据预留同步时段，稍后继续',source_first+3600.01,source)
                 delay=max(0,(last or 0)+INTERVAL-stamp)
                 delay=max(delay,(source_last or 0)+limits.interval-stamp)
                 if not delay:

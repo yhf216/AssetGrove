@@ -15,7 +15,7 @@ class Policy:
 # GitHub API: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
 # All values below are application guardrails, not promised provider allowances.
 POLICIES={
-    'baostock':Policy('BaoStock',10,60,150),
+    'baostock':Policy('BaoStock',1,1500,30000),
     'eastmoney':Policy('东方财富',30,10,30),
     'sina':Policy('新浪财经',30,20,40),
     'tencent':Policy('腾讯财经',30,10,20),
