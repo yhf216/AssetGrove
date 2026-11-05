@@ -1,6 +1,6 @@
 [package]
 name = "assetgrove"
-version = "0.5.12"
+version = "0.5.13"
 description = "AssetGrove local dividend and asset journal"
 edition = "2021"
 
