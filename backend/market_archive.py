@@ -149,7 +149,7 @@ def query(payload,today):
         headers={'User-Agent':'AssetGrove','Accept':'application/octet-stream','Accept-Encoding':'identity'}
         if offset:headers['Range']=f'bytes={offset}-'
         began=time.monotonic()
-        def pending(message):return {'pending':True,'completed':False,'downloaded':part.stat().st_size if part.exists() else 0,'size':SIZE,'source':SOURCE,'message':message}
+        def pending(message,retry_after=1800):return {'pending':True,'completed':False,'downloaded':part.stat().st_size if part.exists() else 0,'size':SIZE,'source':SOURCE,'message':message,'retry_after':retry_after}
         progress(cache,{'phase':'download','pending':True,'completed':False,'downloaded':offset,'message':'正在下载，可断点续传'})
         try:
             with requests.get(URL,headers=headers,timeout=(20,60),stream=True) as response:
@@ -168,7 +168,7 @@ def query(payload,today):
                         if time.monotonic()-reported>=5:
                             stream.flush();progress(cache,{'phase':'download','pending':True,'completed':False,'downloaded':count,'message':'正在下载，可断点续传'});reported=time.monotonic()
                         if count<SIZE and time.monotonic()-began>=DOWNLOAD_SECONDS:
-                            stream.flush();return pending('本轮下载已暂停，下次从当前进度继续')
+                            stream.flush();return pending('本轮下载已暂停，进度已保留',60)
                 if count<SIZE:return pending('下载中断，进度已保留，可继续下载')
                 with part.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
                 if digest!=SHA256:

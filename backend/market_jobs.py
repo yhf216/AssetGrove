@@ -110,7 +110,9 @@ class MarketScheduler:
             self.store.setting('erp_history_attempt',today,write=True)
             self.service.start('erp',managed=True)
             return
-        if self.store.setting('static_history_requested',default=False) and not self.store.setting('static_history',default={}).get('completed') and self.store.setting('static_history_attempt')!=today:
+        archive_rounds=self.store.setting('static_history_rounds',default={})
+        archive_count=archive_rounds.get('count',0) if archive_rounds.get('date')==today else 0
+        if self.store.setting('static_history_requested',default=False) and not (self.store.setting('static_history',default={}) or {}).get('completed') and archive_count<4 and self.store.setting('static_history_next_at',default=0)<=moment.timestamp():
             self.service.start('static_history',managed=True)
             return
         if not self.store.trin_requested():return

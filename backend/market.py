@@ -462,6 +462,9 @@ class MarketService:
         if kind=='static_history':
             self.store.setting('static_history_requested',True,write=True)
             self.store.setting('static_history_attempt',now().date().isoformat(),write=True)
+            if managed:
+                today=now().date().isoformat();rounds=self.store.setting('static_history_rounds',default={})
+                self.store.setting('static_history_rounds',{'date':today,'count':(rounds.get('count',0) if rounds.get('date')==today else 0)+1},write=True)
         def work():
             try:
                 if kind=='history':
@@ -480,6 +483,7 @@ class MarketService:
                     result=self.request('market_static_history',{},timeout=3600)
                     if not result['ok']:raise ValueError(result.get('error','静态历史暂不可用'))
                     self.store.setting('static_history',{**result['data'],'checked':now().date().isoformat()},write=True)
+                    self.store.setting('static_history_next_at',now().timestamp()+max(60,result['data'].get('retry_after',1800)) if result['data'].get('pending') else 0,write=True)
                     self.store.calculate_pending(cancel=self.cancel,limit=10000)
                 else:
                     self.sync_indices()
