@@ -389,13 +389,13 @@ class MarketService:
         self.store.setting('history_enabled',enabled,write=True)
         if enabled:
             self.store.setting('history_next_at',0,write=True)
-        elif self.progress.get('kind') in {'history','erp'}:self.cancel.set()
+        elif self.progress.get('kind') in {'history','erp','static_history'}:self.cancel.set()
 
     def request(self,action,payload,timeout=60):
         if self.cancel.wait(max(0,self.request_interval-(time.monotonic()-self.last_request))):
             return {'ok':False,'cancelled':True,'error':'同步已停止'}
         self.last_request=time.monotonic()
-        scope='history' if self.progress.get('kind') in {'history','erp'} else 'daily'
+        scope='history' if self.progress.get('kind') in {'history','erp','static_history','valuation_history'} else 'daily'
         result=fetch(action,{**payload,'_market_cache':str(self.store.path),'_market_scope':scope,'_market_manual':self.manual},timeout=timeout,cancel=self.cancel)
         if result.get('limited'):raise MarketLimit(result['error'],result['retry_at'],result.get('source',''))
         return result
@@ -459,6 +459,9 @@ class MarketService:
             self.store.setting('history_enabled',True,write=True)
             self.calculation_cancel.clear()
         if kind=='history' and budget is None:budget=75
+        if kind=='static_history':
+            self.store.setting('static_history_requested',True,write=True)
+            self.store.setting('static_history_attempt',now().date().isoformat(),write=True)
         def work():
             try:
                 if kind=='history':

@@ -13,6 +13,7 @@ subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--onefile','--n
                 '--distpath',str(root/'src-tauri/binaries'),'--workpath',str(root/'build/pyinstaller'),
                 '--specpath',str(root/'build'),'--collect-all','baostock','--collect-all','akshare',
                 '--collect-all','tzdata','--collect-all','py_mini_racer',
+                '--collect-all','duckdb','--hidden-import','_duckdb',
                 '--add-data',str(root/'backend/data')+':backend/data','--hidden-import','uvicorn.logging','--hidden-import','uvicorn.loops.auto',
                 '--hidden-import','uvicorn.protocols.http.auto','--hidden-import','uvicorn.protocols.websockets.auto',
                 '--hidden-import','uvicorn.lifespan.on',str(root/'backend_entry.py')],cwd=root,check=True)

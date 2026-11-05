@@ -110,6 +110,9 @@ class MarketScheduler:
             self.store.setting('erp_history_attempt',today,write=True)
             self.service.start('erp',managed=True)
             return
+        if self.store.setting('static_history_requested',default=False) and not self.store.setting('static_history',default={}).get('completed') and self.store.setting('static_history_attempt')!=today:
+            self.service.start('static_history',managed=True)
+            return
         if not self.store.trin_requested():return
         target=last_closed_day(self.store,moment)
         plan=self.store.setting('history_plan')
