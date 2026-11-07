@@ -2,23 +2,12 @@
   <details class="panel indicator-guide">
     <summary>指标说明</summary>
     <div class="indicator-guide-content">
-      <article><h3>TRIN · 涨跌成交量的相对强弱</h3>
-        <p>TRIN =（上涨家数 ÷ 下跌家数）÷（上涨股票成交量 ÷ 下跌股票成交量），也等于下跌股票的平均成交量除以上涨股票的平均成交量。反映成交量更集中于哪一组股票。</p>
-        <table><thead><tr><th>取值</th><th>含义</th></tr></thead><tbody><tr><td>接近 1</td><td>两组股票的平均成交量接近。</td></tr><tr><td>小于 1</td><td>上涨组平均成交量更大；例如 0.5 表示约为下跌组的两倍。</td></tr><tr><td>大于 1</td><td>下跌组平均成交量更大；例如 2 表示约为上涨组的两倍。</td></tr></tbody></table>
-        <p>强势上涨日常见较低值，集中抛压时常见较高值。低于 0.5 或高于 3 可作为相对极端的观察例子，不能单凭这些数值判断顶部或底部。本工具采用沪深 A 股全市场、成交股数口径，阈值不能直接照搬其他市场。</p>
-        <a href="https://chartschool.stockcharts.com/table-of-contents/market-indicators/arms-index-trin" target="_blank" rel="noreferrer">TRIN 口径来源</a>
-      </article>
-      <article><h3>ERP · 股票相对国债的盈利收益率差</h3>
-        <p>ERP = 100 ÷ 沪深300 PE-TTM − 中国10年期国债收益率，单位为百分点。采用滚动利润的盈利收益率，衡量相同估值口径下股票相对国债的回报补偿。</p>
-        <table><thead><tr><th>情况</th><th>含义</th></tr></thead><tbody><tr><td>ERP 越高</td><td>股票盈利收益率相对国债越高，股债相对吸引力通常更强。</td></tr><tr><td>ERP 为 0 或负数</td><td>盈利收益率等于或低于国债收益率。</td></tr><tr><td>PE 20 倍、国债 2%</td><td>ERP = 5% − 2% = 3 个百分点；PE 降为 10 倍、国债不变时，ERP 为 8 个百分点。</td></tr></tbody></table>
-        <p>应结合自身历史分位看高低，没有所有时期通用的固定阈值。80% 分位表示高于历史约 80% 的观测，不代表未来上涨概率。盈利下滑、利率变化都会改变 ERP。</p>
-      </article>
-      <article><h3>PE-TTM 估值通道</h3>
-        <p>PE-TTM 比较指数价格与过去十二个月盈利。通道使用所选十年或全部历史的均值 μ 和样本标准差 σ：阴影为 μ ± 1σ，虚线补充 μ ± 2σ。</p>
-        <p>低于 μ − 1σ 表示相对该历史样本偏低，高于 μ + 1σ 表示相对偏高；P10、P50、P90 分别表示样本的第 10、50、90 百分位。均值与分位均基于所选完整样本，是历史描述，不是当时已知的回测信号或必然回归的价格目标。</p>
-        <p>长期指标默认按周显示，每周取最后记录日期的观测，也可切换日频。底层按实际日数据计算，缺少输入的观测保留空缺，不以月度插值补成周度。静态来源周度更新，源数据的截止日会单独显示。</p>
-        <a href="https://github.com/Ron-Wang/InvestmentQuant" target="_blank" rel="noreferrer">参考仓库与静态数据来源</a>
-      </article>
+      <article><h3>TRIN · 抛压与买盘</h3><p>（上涨家数 ÷ 下跌家数）÷（上涨成交股数 ÷ 下跌成交股数）。小于 1 时成交量偏向上涨组，大于 1 时偏向下跌组；0.5 表示上涨组平均成交量约为下跌组两倍，2 则相反。</p><a href="https://chartschool.stockcharts.com/table-of-contents/market-indicators/arms-index-trin" target="_blank" rel="noreferrer">口径</a></article>
+      <article><h3>WVF · 恐慌指标</h3><p>（近22个交易日最高收盘价 − 当日最低价）÷ 最高收盘价 × 100。越高表示从近期高点回落越深、抛压越强；接近0表示靠近近期高点。它是价格型恐慌代理，非期权隐含波动率。</p><a href="https://www.marketcalls.in/wp-content/uploads/2014/12/VIXFix.pdf" target="_blank" rel="noreferrer">Larry Williams 原文</a></article>
+      <article><h3>50／200日均线趋势</h3><p>曲线 =（收盘价 ÷ MA200 − 1）× 100，正值在200日均线之上，负值在其下。价格与MA50均在MA200之上为牛市趋势，均在其下为熊市趋势；价格先上穿为修复，先下穿为回调，重合时为震荡。</p></article>
+      <article><h3>ERP · 股债收益率差</h3><p>100 ÷ 沪深300 PE-TTM − 中国10年期国债收益率。越高表示股票相对国债的盈利收益率补偿越高；例如PE为20倍、国债为2%，ERP为3个百分点。</p></article>
+      <article><h3>10年期国债收益率</h3><p>单独展示ERP所用的中国10年期国债到期收益率，单位为%。收益率上升时，其他条件不变，ERP下降。</p></article>
+      <article><h3>PE-TTM 估值通道</h3><p>比较当前估值与近十年或全部历史。低于均值−1σ为相对偏低，高于均值+1σ为相对偏高；历史分位越高，估值在所选区间越靠上。</p></article>
     </div>
   </details>
 </template>

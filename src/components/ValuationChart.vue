@@ -21,7 +21,7 @@ function update(){
     grid:{left:64,right:96,top:30,bottom:65},
     xAxis:{type:'category',data:series.map((r:any)=>r.date),boundaryGap:false,axisLabel:{color:ink,hideOverlap:true},axisLine:{lineStyle:{color:border}}},
     yAxis:{type:'value',scale:true,name:'PE-TTM（倍）',nameTextStyle:{color:ink},axisLabel:{color:ink},splitLine:{lineStyle:{color:border,type:'dashed'}}},
-    dataZoom:[{type:'inside',filterMode:'filter',zoomOnMouseWheel:'ctrl',moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || {start:0,end:100})},{type:'slider',bottom:10,height:22,...(zoom || {start:0,end:100})}],
+    dataZoom:[{type:'inside',filterMode:'filter',zoomOnMouseWheel:false,moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || {start:0,end:100})},{type:'slider',bottom:10,height:22,...(zoom || {start:0,end:100})}],
     series:[{name:'PE-TTM',type:'line',data:series.map((r:any)=>r.pe),showSymbol:true,symbolSize:3,connectNulls:false,lineStyle:{color:blue,width:1.8},itemStyle:{color:blue},
       markArea:{silent:true,itemStyle:{color:dark?'rgba(120,160,190,.12)':'rgba(73,127,170,.10)'},data:[[{yAxis:stats.lower1},{yAxis:stats.upper1}]]},
       markLine:{silent:true,symbol:'none',lineStyle:{color:ink,type:'dashed',width:1},label:{color:ink,formatter:(p:any)=>p.name},data:[{name:'均值',yAxis:stats.mean},{name:'−1σ',yAxis:stats.lower1},{name:'+1σ',yAxis:stats.upper1},{name:'−2σ',yAxis:stats.lower2},{name:'+2σ',yAxis:stats.upper2}]}}]},true)
@@ -31,4 +31,4 @@ onMounted(()=>{chart=echarts.init(host.value);chart.on('datazoom',()=>{const z=(
 watch([()=>props.valuation,fontSize,resolvedTheme],update)
 onBeforeUnmount(()=>{observer?.disconnect();chart?.dispose()})
 </script>
-<template><div ref="host" class="valuation-chart" role="img" aria-label="PE-TTM 估值通道，可拖动和缩放" /></template>
+<template><div ref="host" class="valuation-chart" role="img" aria-label="PE-TTM 估值通道，可拖动和缩放" @wheel.capture.passive="$event.stopPropagation()" /></template>

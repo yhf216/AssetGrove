@@ -5,4 +5,6 @@ import './layout.css'
 import './usability.css'
 import './theme.css'
 import './market.css'
+import { installWheelGuard } from './wheel'
+installWheelGuard()
 createApp(App).mount('#app')

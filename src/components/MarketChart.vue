@@ -71,7 +71,7 @@ function update(){
       {type:'value',gridIndex:0,scale:true,position:'right',show:prefs.trin_enabled,name:'TRIN',nameTextStyle:{color:'#bd9147'},axisLabel:{color:'#bd9147'},splitLine:{show:false}},
       ...(prefs.erp_enabled?[{type:'value',gridIndex:0,scale:true,position:'right',offset:prefs.trin_enabled?60:0,name:'ERP',nameTextStyle:{color:'#7b72b4'},axisLabel:{color:'#7b72b4',formatter:(v:number)=>v.toFixed(2)},splitLine:{show:false}}]:[]),
       ...(prefs.volume_enabled?[{type:'value',gridIndex:1,scale:true,splitNumber:2,name:'成交量（股）',nameTextStyle:{color:ink},axisLabel:{color:ink,formatter:(v:number)=>Math.abs(v)>=1e8?(v/1e8).toFixed(1)+'亿':Math.round(v/1e4)+'万'},splitLine:{show:false}}]:[])],
-    dataZoom:[{type:'inside',xAxisIndex:axes,filterMode:'filter',zoomOnMouseWheel:'ctrl',moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || initialZoom)},
+    dataZoom:[{type:'inside',xAxisIndex:axes,filterMode:'filter',zoomOnMouseWheel:false,moveOnMouseMove:true,moveOnMouseWheel:false,...(zoom || initialZoom)},
       {type:'slider',xAxisIndex:axes,filterMode:'filter',bottom:9,height:22,borderColor:border,textStyle:{color:ink},...(zoom || initialZoom)}],series},true)
   chart.dispatchAction({type:'hideTip'})
   updateRange()
@@ -83,9 +83,9 @@ function updateRange(){
   range.value=`显示区间 ${dates[first]} — ${dates[last]}`
 }
 function reset(){zoom=null;update()}
-function handleWheel(event:WheelEvent){if(!event.ctrlKey)event.stopPropagation()}
+function handleWheel(event:WheelEvent){event.stopPropagation()}
 onMounted(()=>{chart=echarts.init(host.value);chart.on('datazoom',()=>{const value=(chart!.getOption() as any).dataZoom?.[0];if(value)zoom={start:value.start,end:value.end};updateRange()});chart.getZr().on('mousemove',(event:any)=>{if(!event.target)chart?.dispatchAction({type:'hideTip'})});chart.getZr().on('globalout',()=>chart?.dispatchAction({type:'hideTip'}));observer=new ResizeObserver(()=>chart?.resize());observer.observe(host.value!);update()})
 watch([()=>props.history,fontSize,resolvedTheme],update,{deep:false})
 onBeforeUnmount(()=>{observer?.disconnect();chart?.dispose()})
 </script>
-<template><div class="market-chart-wrap"><div class="market-chart-meta"><span>{{ range }}</span><button class="text-button" @click="reset">重置视图</button></div><div ref="host" class="market-chart" role="img" aria-label="市场图表，可拖动平移，按住 Ctrl 滚轮缩放" @wheel.capture.passive="handleWheel" /></div></template>
+<template><div class="market-chart-wrap"><div class="market-chart-meta"><span>{{ range }}</span><button class="text-button" @click="reset">重置视图</button></div><div ref="host" class="market-chart" role="img" aria-label="市场图表，可拖动平移，使用底部滑块缩放" @wheel.capture.passive="handleWheel" /></div></template>
