@@ -30,10 +30,13 @@ INDICES = [
     {'symbol':'sh000016','name':'上证50'}, {'symbol':'sz399106','name':'深证综指'},
 ]
 SYMBOLS = {r['symbol'] for r in INDICES}
+WORKSPACE_INDICATORS={'short':{'trin','wvf'},'long':{'erp','trend','bond','valuation'}}
 DEFAULT_PREFS = {'symbols':['sh000001'],'period':'d','chart_type':'candlestick','ma_enabled':False,
                  'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True,
                  'indicator_period':'w','valuation_enabled':True,'valuation_symbol':'sh000300','valuation_years':10,
-                 'wvf_enabled':False,'trend_enabled':False,'bond_enabled':False}
+                 'wvf_enabled':False,'trend_enabled':False,'bond_enabled':False,
+                 'market_mode':'short','short_indicator':'trin','long_indicator':'valuation',
+                 'short_overlays':[],'long_overlays':[],'index_overlay':'line'}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(symbol,date));
@@ -268,6 +271,16 @@ class MarketStore:
                 if prefs['indicator_period'] not in {'d','w'}:raise ValueError('长期指标仅支持日频或周频')
                 if prefs['valuation_symbol'] not in VALUATION_INDICES:raise ValueError('请选择支持的估值指数')
                 if type(prefs['valuation_years']) is not int or prefs['valuation_years'] not in {0,10}:raise ValueError('估值统计请选择近十年或全部历史')
+                if not isinstance(prefs['market_mode'],str) or prefs['market_mode'] not in WORKSPACE_INDICATORS:raise ValueError('请选择短线或长线指标')
+                if not isinstance(prefs['index_overlay'],str) or prefs['index_overlay'] not in {'none','line','candlestick'}:raise ValueError('无效的指数叠加形式')
+                for group,allowed in WORKSPACE_INDICATORS.items():
+                    indicator=prefs[group+'_indicator'];overlays=prefs[group+'_overlays']
+                    if not isinstance(indicator,str) or indicator not in allowed:raise ValueError('无效的市场指标')
+                    if not isinstance(overlays,list) or any(not isinstance(k,str) or k not in allowed for k in overlays) or len(set(overlays))!=len(overlays) or indicator in overlays:raise ValueError('无效的指标叠加组合')
+                if set(body)&{'market_mode','short_indicator','long_indicator','short_overlays','long_overlays'}:
+                    group=prefs['market_mode']
+                    for key in [prefs[group+'_indicator'],*prefs[group+'_overlays']]:
+                        if key!='valuation':prefs[key+'_enabled']=True
                 for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize','wvf_enabled','trend_enabled','bond_enabled']:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 prefs['valuation_enabled']=True
@@ -319,10 +332,12 @@ class MarketStore:
             revision=db.execute('SELECT value FROM market_revision WHERE id=1').fetchone()[0]
             if revision!=self.cached_revision:
                 self.history_cache.clear();self.cached_revision=revision
-            key=json.dumps(prefs,sort_keys=True)
+            # View/overlay changes reuse the same computed data, with fresh preferences.
+            key=json.dumps({k:prefs[k] for k in ['symbols','period','ma_enabled','ma_periods','indicator_period','valuation_symbol','valuation_years']},sort_keys=True)
             if key in self.history_cache:
                 self.history_cache.move_to_end(key)
-                return deepcopy(self.history_cache[key])
+                cached=deepcopy(self.history_cache[key]);cached['preferences']=prefs
+                return cached
             daily={s:rows(db,'SELECT date,open,high,low,close,volume FROM index_bars WHERE symbol=? ORDER BY date',(s,)) for s in prefs['symbols']}
             series={s:aggregate_bars(bars,prefs['period'],prefs['ma_periods'] if prefs['ma_enabled'] else []) for s,bars in daily.items()}
             trin=rows(db,'SELECT t.* FROM trin t LEFT JOIN calendar c ON c.date=t.date WHERE c.trading IS NULL OR c.trading=1 ORDER BY t.date')
@@ -356,7 +371,8 @@ class MarketStore:
                 values['trend']=sample_indicator(values['trend'],indicator_period)
             bond=sample_indicator(rows(db,'SELECT date,yield10 value,source FROM erp_bond ORDER BY date'),indicator_period)
             reference={s:[{'date':r['date'],'close':r['close']} for r in bars] for s,bars in daily.items()}
-            result={'preferences':prefs,'series':series,'reference_series':reference,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'indicators':indicators,'bond':bond,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
+            long_series=series if indicator_period==prefs['period'] else {s:aggregate_bars(bars,indicator_period,prefs['ma_periods'] if prefs['ma_enabled'] else []) for s,bars in daily.items()}
+            result={'preferences':prefs,'series':series,'long_series':long_series,'reference_series':reference,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'indicators':indicators,'bond':bond,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
             self.history_cache[key]=result
             while len(self.history_cache)>3 or (len(self.history_cache)>1 and sum(sum(len(v) for v in item['series'].values())+len(item['trin']) for item in self.history_cache.values())>100000):
                 self.history_cache.popitem(last=False)
