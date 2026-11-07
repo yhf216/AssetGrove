@@ -20,6 +20,7 @@ from .sync_schedule import TIMES
 from .market_erp import save_component, calculate_pending as calculate_erp
 from .market_reference import INDICES as VALUATION_INDICES, PE_SOURCE
 from .market_valuation import save as save_valuation, history as valuation_history, sample as sample_indicator, describe, percentile
+from .market_indicators import price_indicators
 
 INDICES = [
     {'symbol':'sh000001','name':'上证指数'}, {'symbol':'sz399102','name':'创业板综指'},
@@ -31,7 +32,8 @@ INDICES = [
 SYMBOLS = {r['symbol'] for r in INDICES}
 DEFAULT_PREFS = {'symbols':['sh000001'],'period':'d','chart_type':'candlestick','ma_enabled':False,
                  'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True,
-                 'indicator_period':'w','valuation_enabled':True,'valuation_symbol':'sh000300','valuation_years':10}
+                 'indicator_period':'w','valuation_enabled':True,'valuation_symbol':'sh000300','valuation_years':10,
+                 'wvf_enabled':False,'trend_enabled':False,'bond_enabled':False}
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(symbol,date));
@@ -266,11 +268,13 @@ class MarketStore:
                 if prefs['indicator_period'] not in {'d','w'}:raise ValueError('长期指标仅支持日频或周频')
                 if prefs['valuation_symbol'] not in VALUATION_INDICES:raise ValueError('请选择支持的估值指数')
                 if type(prefs['valuation_years']) is not int or prefs['valuation_years'] not in {0,10}:raise ValueError('估值统计请选择近十年或全部历史')
-                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize']:
+                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize','wvf_enabled','trend_enabled','bond_enabled']:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 prefs['valuation_enabled']=True
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
-                if prefs['erp_enabled']:db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if prefs['erp_enabled'] or prefs['bond_enabled']:
+                    if not db.execute("SELECT 1 FROM meta WHERE key='erp_requested' AND value='true'").fetchone():db.execute("DELETE FROM meta WHERE key='erp_history_attempt'")
+                    db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['trin_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             prefs['valuation_enabled']=True # Compatibility with saved preferences from older versions.
@@ -342,10 +346,17 @@ class MarketStore:
             erp_values=[r['value'] for r in erp if r['value'] is not None]
             erp_statistics=describe(erp_values)
             if erp_statistics:erp_statistics['percentile']=percentile(sorted(erp_values),erp_values[-1])
-            indicator_period=prefs['indicator_period'] if prefs['period']=='d' else prefs['period']
+            indicator_period=prefs['indicator_period']
             erp=sample_indicator(erp,indicator_period)
             if erp_frequency!='monthly':erp_frequency={'w':'weekly','m':'monthly','d':'daily'}[indicator_period]
-            result={'preferences':prefs,'series':series,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
+            trading=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 ORDER BY date')]
+            indicators={s:price_indicators(bars,trading) for s,bars in daily.items()}
+            for values in indicators.values():
+                values['wvf']=sample_indicator(values['wvf'],prefs['period'])
+                values['trend']=sample_indicator(values['trend'],indicator_period)
+            bond=sample_indicator(rows(db,'SELECT date,yield10 value,source FROM erp_bond ORDER BY date'),indicator_period)
+            reference={s:[{'date':r['date'],'close':r['close']} for r in bars] for s,bars in daily.items()}
+            result={'preferences':prefs,'series':series,'reference_series':reference,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'indicators':indicators,'bond':bond,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
             self.history_cache[key]=result
             while len(self.history_cache)>3 or (len(self.history_cache)>1 and sum(sum(len(v) for v in item['series'].values())+len(item['trin']) for item in self.history_cache.values())>100000):
                 self.history_cache.popitem(last=False)
