@@ -1,4 +1,4 @@
-"""Price-only indicators, calculated from cached daily bars without network I/O."""
+"""Indicators calculated from cached daily prices and volumes without network I/O."""
 from bisect import bisect_right
 from collections import deque
 import math
@@ -35,3 +35,27 @@ def price_indicators(bars, trading_days=()):
         trend.append({'date':day,'value':bias,'ma50':ma50,'ma200':ma200,'close':close if valid else None,'state':state})
         previous=day
     return {'wvf':wvf,'trend':trend}
+
+
+def volume_price_confirmation(bars,trading_days=(),period=20):
+    """VPC = VWMA - SMA over consecutive daily observations, in price points."""
+    expected=sorted(trading_days);window=deque(maxlen=period);previous=None;result=[]
+    for row in bars:
+        day=row['date'];close=row.get('close');volume=row.get('volume')
+        gap=previous is not None and bisect_right(expected,day)-bisect_right(expected,previous)>1
+        valid=all(isinstance(v,(int,float)) and math.isfinite(v) for v in [close,volume]) and close>0 and volume>=0
+        if gap or not valid:window.clear()
+        value=sma=vwma=None
+        if valid:
+            window.append((close,volume))
+            if len(window)==period:
+                total=math.fsum(v for _,v in window)
+                if total>0:
+                    sma=math.fsum(c for c,_ in window)/period
+                    # Center prices before weighting for a stable near-zero difference.
+                    value=math.fsum((c-sma)*v for c,v in window)/total
+                    if abs(value)<1e-12*max(1,abs(sma)):value=0.
+                    vwma=sma+value
+        result.append({'date':day,'value':value,'sma':sma,'vwma':vwma})
+        previous=day
+    return result

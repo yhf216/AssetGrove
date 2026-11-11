@@ -17,13 +17,14 @@ const indicators=computed(()=>history.value?.indicators?.[primary.value] || {wvf
 const definitions:Record<string,any>={
   trin:{id:'trin',name:'TRIN · 沪深 A 股',label:'TRIN',axis:'TRIN',unit:'',color:'#bd9147',baseline:1,months:1},
   breadth:{id:'breadth',name:'宽广度 · 沪深 A 股',label:'宽广度',axis:'净上涨家数',unit:'家',color:'#638b49',baseline:0,months:1},
+  vpc:{id:'vpc',name:'量价差（VPC20）',label:'量价差（VPC）',axis:'量价差（点）',unit:'点',color:'#a16eab',baseline:0,months:1},
   wvf:{id:'wvf',name:'WVF 恐慌指标',label:'WVF 恐慌指标',axis:'WVF (%)',unit:'%',color:'#bb796b',months:1},
   trend:{id:'trend',name:'50／200日均线趋势',label:'均线趋势',axis:'偏离 (%)',unit:'%',color:'#4b8e80',baseline:0,months:36},
   erp:{id:'erp',name:'ERP · 沪深300',label:'ERP',axis:'ERP (百分点)',unit:'个百分点',color:'#7b72b4',months:120},
   bond:{id:'bond',name:'中国10年期国债收益率',label:'10年期国债',axis:'国债 (%)',unit:'%',color:'#497faa',months:120},
   valuation:{id:'valuation',name:'PE-TTM 估值通道',label:'PE-TTM 估值通道',axis:'PE (倍)',unit:'倍',color:'#5981a7',months:120},
 }
-const choices=computed(()=>prefs.market_mode==='short'?['trin','breadth','wvf']:['valuation','erp','trend','bond'])
+const choices=computed(()=>prefs.market_mode==='short'?['trin','breadth','vpc','wvf']:['valuation','erp','trend','bond'])
 const selected=computed<string>(()=>prefs[prefs.market_mode+'_indicator'])
 const overlays=computed<string[]>(()=>prefs[prefs.market_mode+'_overlays'])
 const hasValuation=computed(()=>[selected.value,...overlays.value].includes('valuation'))
@@ -31,8 +32,8 @@ const period=computed(()=>prefs.market_mode==='short'?(history.value?.preference
 const bars=computed(()=>history.value?.[prefs.market_mode==='short'?'series':'long_series']?.[primary.value] || [])
 const metrics=computed<Metric[]>(()=>[selected.value,...overlays.value].map(id=>{
   const definition=definitions[id]
-  const rows=id==='trin'?history.value?.trin:id==='breadth'?history.value?.breadth:id==='wvf'?indicators.value.wvf:id==='trend'?indicators.value.trend:id==='erp'?history.value?.erp:id==='bond'?history.value?.bond:(history.value?.valuation?.series || []).map((r:any)=>({...r,value:r.pe}))
-  const name=id==='wvf' || id==='trend'?definition.name+' · '+primaryName.value:id==='valuation'?definition.name+' · '+(history.value?.valuation?.name || ''):definition.name
+  const rows=id==='trin'?history.value?.trin:id==='breadth'?history.value?.breadth:id==='wvf'?indicators.value.wvf:id==='vpc'?indicators.value.vpc:id==='trend'?indicators.value.trend:id==='erp'?history.value?.erp:id==='bond'?history.value?.bond:(history.value?.valuation?.series || []).map((r:any)=>({...r,value:r.pe}))
+  const name=['wvf','trend','vpc'].includes(id)?definition.name+' · '+primaryName.value:id==='valuation'?definition.name+' · '+(history.value?.valuation?.name || ''):definition.name
   return {...definition,name:id==='breadth' && period.value!=='d'?name+'（日均）':name,rows:rows || [],...(id==='valuation'?{statistics:history.value?.valuation?.statistics}:{})}
 }))
 const viewKey=computed(()=>JSON.stringify([prefs.market_mode,selected.value,primary.value,period.value,prefs.valuation_symbol,prefs.valuation_years]))

@@ -32,7 +32,7 @@ export function workspaceOption(input:Input){
     const byPeriod=new Map(metric.rows.map(r=>[periodKey(r.date,period),r]))
     axes.push(axis(metric.axis,metric.color,index,metric.baseline))
     const line:any={id:metric.id,name:metric.name,type:'line',yAxisIndex:index,z:4+index,data:keys.map(k=>byPeriod.get(k)?.value ?? null),connectNulls:false,showSymbol:true,symbolSize:5,lineStyle:{width:index===0?2:1.4,color:metric.color},itemStyle:{color:metric.color},
-      tooltip:{formatter:(p:any)=>{const row=byPeriod.get(periodKey(p.name,period));return `${escape(metric.name)}<br/>${escape(row?.date || p.name)}<br/>${Number(p.value).toFixed(2)} ${escape(metric.unit)}${row?.state?'<br/>'+escape(row.state):''}${row?.ma200!=null?'<br/>MA50：'+row.ma50.toFixed(2)+'<br/>MA200：'+row.ma200.toFixed(2):''}`}}}
+      tooltip:{formatter:(p:any)=>{const row=byPeriod.get(periodKey(p.name,period));return `${escape(metric.name)}<br/>${escape(row?.date || p.name)}<br/>${Number(p.value).toFixed(2)} ${escape(metric.unit)}${row?.state?'<br/>'+escape(row.state):''}${row?.ma200!=null?'<br/>MA50：'+row.ma50.toFixed(2)+'<br/>MA200：'+row.ma200.toFixed(2):''}${row?.vwma!=null?'<br/>VWMA20：'+row.vwma.toFixed(2)+'<br/>SMA20：'+row.sma.toFixed(2):''}`}}}
     if(metric.baseline!=null)line.markLine={silent:true,symbol:'none',label:{formatter:String(metric.baseline)},lineStyle:{color:metric.color,type:'dashed'},data:[{yAxis:metric.baseline}]}
     if(metric.statistics){
       const stats=metric.statistics
