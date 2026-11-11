@@ -21,6 +21,7 @@ from .market_erp import save_component, calculate_pending as calculate_erp
 from .market_reference import INDICES as VALUATION_INDICES, PE_SOURCE
 from .market_valuation import save as save_valuation, history as valuation_history, sample as sample_indicator, describe, percentile
 from .market_indicators import price_indicators
+from .market_breadth import net_advances
 
 INDICES = [
     {'symbol':'sh000001','name':'上证指数'}, {'symbol':'sz399102','name':'创业板综指'},
@@ -30,11 +31,11 @@ INDICES = [
     {'symbol':'sh000016','name':'上证50'}, {'symbol':'sz399106','name':'深证综指'},
 ]
 SYMBOLS = {r['symbol'] for r in INDICES}
-WORKSPACE_INDICATORS={'short':{'trin','wvf'},'long':{'erp','trend','bond','valuation'}}
+WORKSPACE_INDICATORS={'short':{'trin','wvf','breadth'},'long':{'erp','trend','bond','valuation'}}
 DEFAULT_PREFS = {'symbols':['sh000001'],'period':'d','chart_type':'candlestick','ma_enabled':False,
                  'ma_periods':[10,20,50,250],'volume_enabled':True,'trin_enabled':False,'erp_enabled':False,'normalize':True,
                  'indicator_period':'w','valuation_enabled':True,'valuation_symbol':'sh000300','valuation_years':10,
-                 'wvf_enabled':False,'trend_enabled':False,'bond_enabled':False,
+                 'wvf_enabled':False,'trend_enabled':False,'bond_enabled':False,'breadth_enabled':False,
                  'market_mode':'short','short_indicator':'trin','long_indicator':'valuation',
                  'short_overlays':[],'long_overlays':[],'index_overlay':'line'}
 SCHEMA = '''
@@ -179,7 +180,8 @@ class MarketStore:
         with self.connect() as db:enqueue_cached(db,force)
 
     def trin_requested(self):
-        if self.setting('trin_requested',default=False) or self.preferences()['trin_enabled']:return True
+        prefs=self.preferences()
+        if self.setting('trin_requested',default=False) or prefs['trin_enabled'] or prefs['breadth_enabled']:return True
         with self.connect() as db:
             return bool(db.execute('SELECT 1 FROM trin LIMIT 1').fetchone() or db.execute('SELECT 1 FROM breadth LIMIT 1').fetchone())
 
@@ -281,14 +283,14 @@ class MarketStore:
                     group=prefs['market_mode']
                     for key in [prefs[group+'_indicator'],*prefs[group+'_overlays']]:
                         if key!='valuation':prefs[key+'_enabled']=True
-                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize','wvf_enabled','trend_enabled','bond_enabled']:
+                for key in ['ma_enabled','volume_enabled','trin_enabled','erp_enabled','valuation_enabled','normalize','wvf_enabled','trend_enabled','bond_enabled','breadth_enabled']:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 prefs['valuation_enabled']=True
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
                 if prefs['erp_enabled'] or prefs['bond_enabled']:
                     if not db.execute("SELECT 1 FROM meta WHERE key='erp_requested' AND value='true'").fetchone():db.execute("DELETE FROM meta WHERE key='erp_history_attempt'")
                     db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-                if prefs['trin_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if prefs['trin_enabled'] or prefs['breadth_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             prefs['valuation_enabled']=True # Compatibility with saved preferences from older versions.
             return prefs
@@ -341,6 +343,8 @@ class MarketStore:
             daily={s:rows(db,'SELECT date,open,high,low,close,volume FROM index_bars WHERE symbol=? ORDER BY date',(s,)) for s in prefs['symbols']}
             series={s:aggregate_bars(bars,prefs['period'],prefs['ma_periods'] if prefs['ma_enabled'] else []) for s,bars in daily.items()}
             trin=rows(db,'SELECT t.* FROM trin t LEFT JOIN calendar c ON c.date=t.date WHERE c.trading IS NULL OR c.trading=1 ORDER BY t.date')
+            trading=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 ORDER BY date')]
+            breadth=net_advances(trin,{day for day in trading if day<=now().date().isoformat()} | {r['date'] for bars in daily.values() for r in bars},prefs['period'])
             pe_count,months=db.execute('SELECT COUNT(*),COUNT(DISTINCT SUBSTR(date,1,7)) FROM erp_pe').fetchone()
             erp_frequency='monthly' if pe_count and pe_count<=months*1.1 else 'daily'
             erp=rows(db,'SELECT p.date,e.value,p.pe,e.bond_yield,p.source pe_source,e.bond_source FROM erp_pe p LEFT JOIN erp e ON e.date=p.date ORDER BY p.date') if pe_count else rows(db,'SELECT * FROM erp ORDER BY date')
@@ -364,7 +368,6 @@ class MarketStore:
             indicator_period=prefs['indicator_period']
             erp=sample_indicator(erp,indicator_period)
             if erp_frequency!='monthly':erp_frequency={'w':'weekly','m':'monthly','d':'daily'}[indicator_period]
-            trading=[r[0] for r in db.execute('SELECT date FROM calendar WHERE trading=1 ORDER BY date')]
             indicators={s:price_indicators(bars,trading) for s,bars in daily.items()}
             for values in indicators.values():
                 values['wvf']=sample_indicator(values['wvf'],prefs['period'])
@@ -372,7 +375,7 @@ class MarketStore:
             bond=sample_indicator(rows(db,'SELECT date,yield10 value,source FROM erp_bond ORDER BY date'),indicator_period)
             reference={s:[{'date':r['date'],'close':r['close']} for r in bars] for s,bars in daily.items()}
             long_series=series if indicator_period==prefs['period'] else {s:aggregate_bars(bars,indicator_period,prefs['ma_periods'] if prefs['ma_enabled'] else []) for s,bars in daily.items()}
-            result={'preferences':prefs,'series':series,'long_series':long_series,'reference_series':reference,'trin':trin,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'indicators':indicators,'bond':bond,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
+            result={'preferences':prefs,'series':series,'long_series':long_series,'reference_series':reference,'trin':trin,'breadth':breadth,'erp':erp,'erp_frequency':erp_frequency,'erp_statistics':erp_statistics,'indicators':indicators,'bond':bond,'valuation':valuation_history(db,prefs),'coverage':rows(db,'SELECT * FROM index_info ORDER BY symbol'),'revision':revision}
             self.history_cache[key]=result
             while len(self.history_cache)>3 or (len(self.history_cache)>1 and sum(sum(len(v) for v in item['series'].values())+len(item['trin']) for item in self.history_cache.values())>100000):
                 self.history_cache.popitem(last=False)

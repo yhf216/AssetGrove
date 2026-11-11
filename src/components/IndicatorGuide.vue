@@ -2,6 +2,7 @@
   <details class="panel indicator-guide">
     <summary>指标说明</summary>
     <div class="indicator-guide-content">
+      <article><h3>宽广度 · 涨跌家数差</h3><p>上涨家数 − 下跌家数。正值表示上涨股票更多，负值表示下跌股票更多；指数上涨而宽广度为负，表示上涨集中于少数股票。与TRIN使用相同沪深A股样本，平盘和停牌不计入涨跌组，周／月显示日均值。</p><a href="https://chartschool.stockcharts.com/table-of-contents/market-indicators/advance-decline-line" target="_blank" rel="noreferrer">净涨跌家数口径</a></article>
       <article><h3>TRIN · 抛压与买盘</h3><p>（上涨家数 ÷ 下跌家数）÷（上涨成交股数 ÷ 下跌成交股数）。小于 1 时成交量偏向上涨组，大于 1 时偏向下跌组；0.5 表示上涨组平均成交量约为下跌组两倍，2 则相反。</p><a href="https://chartschool.stockcharts.com/table-of-contents/market-indicators/arms-index-trin" target="_blank" rel="noreferrer">口径</a></article>
       <article><h3>WVF · 恐慌指标</h3><p>（近22个交易日最高收盘价 − 当日最低价）÷ 最高收盘价 × 100。越高表示从近期高点回落越深、抛压越强；接近0表示靠近近期高点。它是价格型恐慌代理，非期权隐含波动率。</p><a href="https://www.marketcalls.in/wp-content/uploads/2014/12/VIXFix.pdf" target="_blank" rel="noreferrer">Larry Williams 原文</a></article>
       <article><h3>50／200日均线趋势</h3><p>曲线 =（收盘价 ÷ MA200 − 1）× 100，正值在200日均线之上，负值在其下。价格与MA50均在MA200之上为牛市趋势，均在其下为熊市趋势；价格先上穿为修复，先下穿为回调，重合时为震荡。</p></article>
