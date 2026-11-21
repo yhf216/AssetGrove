@@ -17,9 +17,9 @@ from .market_cache import install_cache, calculate_trin, save_breadth, enqueue_c
 from .market_history import repair_ranges, repair_priority, history_work
 from .market_network import MarketBudget, MarketLimit
 from .sync_schedule import TIMES
-from .market_erp import save_component, calculate_pending as calculate_erp
-from .market_reference import INDICES as VALUATION_INDICES, PE_SOURCE
-from .market_valuation import save as save_valuation, history as valuation_history, sample as sample_indicator, describe, percentile
+from .market_erp import calculate_pending as calculate_erp
+from .market_reference import INDICES as VALUATION_INDICES
+from .market_valuation import history as valuation_history, preferred_csi_source, sample as sample_indicator, describe, percentile
 from .market_indicators import price_indicators,volume_price_confirmation
 from .market_breadth import net_advances
 
@@ -265,6 +265,8 @@ class MarketStore:
             prefs={**DEFAULT_PREFS,**(json.loads(old[0]) if old else {})}
             if body is not None:
                 if set(body)-set(DEFAULT_PREFS):raise ValueError('未知市场设置')
+                previous_valuation=prefs['valuation_symbol']
+                previous_symbols=prefs['symbols']
                 prefs.update(body)
                 if not isinstance(prefs['symbols'],list) or not 1<=len(prefs['symbols'])<=len(INDICES) or len(set(prefs['symbols']))!=len(prefs['symbols']) or not set(prefs['symbols'])<=SYMBOLS:raise ValueError('请选择有效指数')
                 if prefs['period'] not in {'d','w','m'} or prefs['chart_type'] not in {'line','candlestick'}:raise ValueError('无效图表周期')
@@ -287,9 +289,14 @@ class MarketStore:
                     if type(prefs[key]) is not bool:raise ValueError('无效图表选项')
                 prefs['valuation_enabled']=True
                 db.execute("INSERT INTO meta VALUES('preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(prefs,ensure_ascii=False),))
-                if prefs['erp_enabled'] or prefs['bond_enabled']:
+                if prefs['erp_enabled']:
                     if not db.execute("SELECT 1 FROM meta WHERE key='erp_requested' AND value='true'").fetchone():db.execute("DELETE FROM meta WHERE key='erp_history_attempt'")
                     db.execute("INSERT INTO meta VALUES('erp_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if prefs['bond_enabled']:
+                    if not db.execute("SELECT 1 FROM meta WHERE key='bond_requested' AND value='true'").fetchone():db.execute("DELETE FROM meta WHERE key='erp_history_attempt'")
+                    db.execute("INSERT INTO meta VALUES('bond_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if previous_valuation!=prefs['valuation_symbol'] or previous_symbols!=prefs['symbols']:
+                    db.execute("DELETE FROM meta WHERE key='erp_history_attempt'")
                 if prefs['trin_enabled'] or prefs['breadth_enabled']:db.execute("INSERT INTO meta VALUES('trin_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 if prefs['valuation_enabled']:db.execute("INSERT INTO meta VALUES('valuation_requested','true') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             prefs['valuation_enabled']=True # Compatibility with saved preferences from older versions.
@@ -348,8 +355,8 @@ class MarketStore:
             pe_count,months=db.execute('SELECT COUNT(*),COUNT(DISTINCT SUBSTR(date,1,7)) FROM erp_pe').fetchone()
             erp_frequency='monthly' if pe_count and pe_count<=months*1.1 else 'daily'
             erp=rows(db,'SELECT p.date,e.value,p.pe,e.bond_yield,p.source pe_source,e.bond_source FROM erp_pe p LEFT JOIN erp e ON e.date=p.date ORDER BY p.date') if pe_count else rows(db,'SELECT * FROM erp ORDER BY date')
-            reference=any(r['pe_source']==PE_SOURCE for r in erp)
-            if reference:erp=[r for r in erp if r['pe_source']==PE_SOURCE];erp_frequency='daily'
+            reference=preferred_csi_source(db,'erp_pe')
+            if reference:erp=[r for r in erp if r['pe_source']==reference];erp_frequency='daily'
             if prefs['period']!='d':
                 groups=defaultdict(list);expected=defaultdict(set)
                 for bars in daily.values():
@@ -455,6 +462,7 @@ class MarketService:
             calculation=dict(self.calculation)
         progress['job_revision']=progress['revision']
         progress['revision']=self.store.chart_revision()
+        prefs=self.store.preferences()
         with self.store.connect() as db:
             stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM trin WHERE value IS NOT NULL').fetchone()
             latest=db.execute('SELECT * FROM trin WHERE value IS NOT NULL ORDER BY date DESC LIMIT 1').fetchone()
@@ -462,16 +470,20 @@ class MarketService:
             gap=db.execute('SELECT t.date,t.coverage,t.reason FROM trin t LEFT JOIN calendar c ON c.date=t.date WHERE t.value IS NULL AND (c.trading IS NULL OR c.trading=1) ORDER BY t.date DESC LIMIT 1').fetchone()
             erp_stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM erp').fetchone()
             latest_erp=db.execute('SELECT * FROM erp ORDER BY date DESC LIMIT 1').fetchone()
-            if db.execute('SELECT 1 FROM erp_pe WHERE source=? LIMIT 1',(PE_SOURCE,)).fetchone():
-                erp_stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM erp WHERE pe_source=?',(PE_SOURCE,)).fetchone()
-                latest_erp=db.execute('SELECT * FROM erp WHERE pe_source=? ORDER BY date DESC LIMIT 1',(PE_SOURCE,)).fetchone()
+            reference=preferred_csi_source(db,'erp_pe')
+            if reference:
+                erp_stats=db.execute('SELECT COUNT(*),MIN(date),MAX(date) FROM erp WHERE pe_source=?',(reference,)).fetchone()
+                latest_erp=db.execute('SELECT * FROM erp WHERE pe_source=? ORDER BY date DESC LIMIT 1',(reference,)).fetchone()
         from .market_closing import status as closing_status
-        return {'catalog':INDICES,'preferences':self.store.preferences(),'progress':progress,'calculation':calculation,'closing':closing_status(self.store),'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
+        bond_error=self.store.setting('bond_error',default='')
+        return {'catalog':INDICES,'preferences':prefs,'progress':progress,'calculation':calculation,'closing':closing_status(self.store),'latest_trin':dict(latest) if latest else None,'trin_coverage':{'count':stats[0],'first':stats[1],'last':stats[2]},'cache_path':str(self.store.path),
                 'history_pending':{'count':pending,'latest':dict(gap) if gap else None},
-                'erp_coverage':{'count':erp_stats[0],'first':erp_stats[1],'last':erp_stats[2]},'latest_erp':dict(latest_erp) if latest_erp else None,'erp_error':self.store.setting('erp_error',default=''),
+                'erp_coverage':{'count':erp_stats[0],'first':erp_stats[1],'last':erp_stats[2]},'latest_erp':dict(latest_erp) if latest_erp else None,
+                'erp_error':'；'.join(filter(None,[self.store.setting('valuation_error_sh000300',default=''),bond_error])),
+                'bond_error':bond_error,
                 'valuation_catalog':[{'symbol':symbol,'name':entry[0]} for symbol,entry in VALUATION_INDICES.items()],
-                'valuation_status':self.store.setting('reference_'+self.store.preferences()['valuation_symbol'],default={}),
-                'valuation_error':self.store.setting('valuation_error_'+self.store.preferences()['valuation_symbol'],default=''),
+                'valuation_status':self.store.setting('reference_'+prefs['valuation_symbol'],default={}),
+                'valuation_error':self.store.setting('valuation_error_'+prefs['valuation_symbol'],default=''),
                 'static_history':self.store.setting('static_history',default=None),
                 'network':{**self.network.status(),'message':self.store.setting('market_network_message',default=''),'retry_at':self.store.setting('market_network_retry',default=0)},
                 'background':{'enabled':self.store.setting('history_enabled',default=True),'plan':self.store.setting('history_plan'),'next_at':self.store.setting('history_next_at',default=0),'last_daily':self.store.setting('daily_success'),'sync_time':' / '.join(TIMES),'error':self.store.setting('background_error',default='')}}
@@ -513,7 +525,15 @@ class MarketService:
                 if kind=='history':
                     result=self.backfill(start,end,budget=budget)
                     if not self.cancel.is_set():self.scheduler.completed(start,end,result)
-                elif kind=='erp':self.sync_erp(history=True)
+                elif kind=='erp':
+                    self.sync_erp()
+                    symbols=self.store.preferences()['symbols']
+                    pending=[symbol for symbol in symbols if self.store.setting('index_history_pending_'+symbol,default=False)]
+                    if (self.manual or pending) and not self.cancel.is_set():
+                        from .market_jobs import last_closed_day
+                        self.index_target=last_closed_day(self.store)
+                        self.index_refresh=True
+                        self.sync_indices(include_breadth=False,only=None if self.manual else pending)
                 elif kind=='closing':self.sync_closing(daily_target)
                 elif kind in {'valuation','valuation_history'}:self.sync_erp(valuation_only=True,repair=kind=='valuation_history')
                 elif kind=='static_history':
@@ -530,8 +550,8 @@ class MarketService:
                     self.store.setting('static_history_next_at',now().timestamp()+max(60,result['data'].get('retry_after',1800)) if result['data'].get('pending') else 0,write=True)
                     self.store.calculate_pending(cancel=self.cancel,limit=10000)
                 else:
-                    self.sync_indices()
-                    self.sync_erp()
+                    try:self.sync_indices()
+                    finally:self.sync_erp()
                     if not self.cancel.is_set() and not self.progress['errors']:
                         self.store.setting('daily_success',daily_target,write=True)
                         self.store.setting('daily_retry_at',0,write=True)
@@ -597,62 +617,16 @@ class MarketService:
         self.update(phase=('收盘数据已完整 ' if current['complete'] else '收盘数据待补齐 ')+target)
         return current
 
-    def sync_erp(self,history=False,valuation_only=False,repair=False):
-        erp_requested=not valuation_only and self.store.setting('erp_requested',default=False)
-        if self.cancel.is_set():return
-        from .market_jobs import last_closed_day
-        target=date.fromisoformat(last_closed_day(self.store))
-        friday=(target-timedelta(days=(target.weekday()-4)%7)).isoformat()
-        today=now().date().isoformat();symbols=set()
-        if erp_requested:symbols.add('sh000300')
-        symbols.add(self.store.preferences()['valuation_symbol'])
-        tasks=[('index',symbol) for symbol in sorted(symbols)]
-        if erp_requested:tasks.append(('bond','bond'))
-        errors=[];attempted=False
-        for kind,key in tasks:
-            if self.cancel.is_set():return
-            stamp=self.store.setting('reference_'+key,default={})
-            with self.store.connect() as db:
-                if kind=='index':bounds=db.execute('SELECT MIN(date),MAX(date),COUNT(*) FROM valuation_bars WHERE symbol=?',(key,)).fetchone()
-                else:bounds=db.execute('SELECT MIN(date),MAX(date),COUNT(*) FROM erp_bond').fetchone()
-            reusable=bool(bounds[0] and bounds[1]==stamp.get('asof') and bounds[2]==stamp.get('count') and bounds[0]==stamp.get('first'))
-            if not self.manual and (stamp.get('checked')==today or (reusable and stamp.get('asof','')>=friday)):continue
-            attempted=True
-            self.store.setting('reference_'+key,{**stamp,'checked':today},write=True)
-            payload={'etag':stamp.get('etag') if reusable and not repair else None}
-            if kind=='index':payload['symbol']=key
-            self.update(phase='同步长期指标静态历史：'+(VALUATION_INDICES[key][0] if kind=='index' else '十年国债'))
-            try:response=self.request('market_reference_'+kind,payload,timeout=120)
-            except MarketLimit as exc:
-                if not exc.source:raise
-                response={'ok':False,'error':str(exc)}
-            if not response['ok']:
-                message=response.get('error','参考数据暂不可用');errors.append(message)
-                if kind=='index':self.store.setting('valuation_error_'+key,message,write=True)
-                continue
-            data=response['data']
-            if data.get('unchanged'):
-                if not reusable:errors.append('本地历史不完整，请补齐估值历史');continue
-                self.store.setting('reference_'+key,{**stamp,'checked':today,'etag':data.get('etag') or stamp.get('etag')},write=True)
-                if kind=='index':self.store.setting('valuation_error_'+key,'',write=True)
-                continue
-            records=data['records']
-            with self.store.connect() as db:
-                if kind=='index':
-                    save_valuation(db,key,records)
-                    from .market_reference import save_quotes
-                    save_quotes(db,key,records,today)
-                    if key=='sh000300':save_component(db,'pe',records,today)
-                else:save_component(db,'bond',records,today)
-            self.store.setting('reference_'+key,{'checked':today,'first':min(r['date'] for r in records),'count':len(records),'asof':max(r['date'] for r in records),'etag':data.get('etag'),'sha256':data.get('sha256'),'url':data.get('url')},write=True)
-            if kind=='index':self.store.setting('valuation_error_'+key,'',write=True)
-            self.store.calculate_pending(cancel=self.cancel,limit=10000)
-        if attempted:self.store.setting('erp_error','；'.join(errors),write=True)
+    def sync_erp(self,valuation_only=False,repair=False):
+        from .market_reference_sync import sync
+        if not self.manual and not self.store.setting('history_enabled',default=True):return
+        sync(self,valuation_only=valuation_only,repair=repair)
+        self.store.calculate_pending(cancel=self.cancel,limit=10000)
 
-    def sync_indices(self):
+    def sync_indices(self,include_breadth=True,only=None):
         from .market_jobs import last_closed_day
         target=self.index_target or last_closed_day(self.store)
-        selected=set(self.store.preferences()['symbols'])
+        selected=set(self.store.preferences()['symbols'] if only is None else only)
         indices=[index for index in INDICES if index['symbol'] in selected]
         self.update(total=len(indices)+1)
         for i,index in enumerate(indices):
@@ -684,7 +658,7 @@ class MarketService:
                 else:
                     with self.lock:self.progress['errors'].append(index['name']+'：'+'；'.join(errors))
         if self.cancel.is_set():return
-        if not self.store.trin_requested():
+        if not include_breadth or not self.store.trin_requested():
             self.update(done=len(indices)+1);return
         if self.job_kind=='closing':self.update(done=len(indices)+1);return
         closed=target<now().date().isoformat() or now().strftime('%H:%M')>='15:10'

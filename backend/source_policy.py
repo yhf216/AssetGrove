@@ -22,6 +22,8 @@ POLICIES={
     'xueqiu':Policy('雪球',60,6,12),
     'legulegu':Policy('乐咕乐股',60,6,12),
     'chinabond':Policy('中债',60,6,12),
+    'csindex':Policy('中证指数',60,6,12),
+    'eniu':Policy('亿牛网',60,6,12),
     'exchange':Policy('交易所网站',60,6,12),
     'github_api':Policy('GitHub API',10,30,60),
     'github_pages':Policy('估值静态数据',60,3,6),
@@ -37,7 +39,7 @@ def source_key(value):
     def domain(suffix):return host==suffix or host.endswith('.'+suffix)
     for suffix,key in [('eastmoney.com','eastmoney'),('sinajs.cn','sina'),('sina.com.cn','sina'),('sina.com','sina'),
                        ('gtimg.cn','tencent'),('qq.com','tencent'),('xueqiu.com','xueqiu'),('legulegu.com','legulegu'),
-                       ('chinabond.com.cn','chinabond'),('sse.com.cn','exchange'),('szse.cn','exchange'),
+                       ('chinabond.com.cn','chinabond'),('csindex.com.cn','csindex'),('eniu.com','eniu'),('sse.com.cn','exchange'),('szse.cn','exchange'),
                        ('api.github.com','github_api'),('github.io','github_pages'),('githubusercontent.com','github_downloads')]:
         if domain(suffix):return key
     return host

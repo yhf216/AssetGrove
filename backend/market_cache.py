@@ -56,7 +56,7 @@ def install_cache(db):
     install_erp(db)
     from .market_valuation import install
     install(db)
-    for table in ['index_bars','index_info','trin','erp']:
+    for table in ['index_bars','index_info','trin','erp','erp_pe','erp_bond']:
         for operation in ['INSERT','UPDATE','DELETE']:
             db.execute(f'CREATE TRIGGER IF NOT EXISTS {table}_revision_{operation.lower()} AFTER {operation} ON {table} BEGIN UPDATE market_revision SET value=value+1 WHERE id=1; END')
     version=db.execute("SELECT value FROM meta WHERE key='calculation_cache_version'").fetchone()

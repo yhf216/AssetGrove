@@ -28,13 +28,16 @@ const choices=computed(()=>prefs.market_mode==='short'?['trin','breadth','vpc','
 const selected=computed<string>(()=>prefs[prefs.market_mode+'_indicator'])
 const overlays=computed<string[]>(()=>prefs[prefs.market_mode+'_overlays'])
 const hasValuation=computed(()=>[selected.value,...overlays.value].includes('valuation'))
+const valuation=computed(()=>history.value?.valuation?.symbol===prefs.valuation_symbol?history.value.valuation:null)
+const hasERP=computed(()=>[selected.value,...overlays.value].includes('erp'))
+const hasBond=computed(()=>[selected.value,...overlays.value].includes('bond'))
 const period=computed(()=>prefs.market_mode==='short'?(history.value?.preferences.period || prefs.period):(history.value?.preferences.indicator_period || prefs.indicator_period))
 const bars=computed(()=>history.value?.[prefs.market_mode==='short'?'series':'long_series']?.[primary.value] || [])
 const metrics=computed<Metric[]>(()=>[selected.value,...overlays.value].map(id=>{
   const definition=definitions[id]
-  const rows=id==='trin'?history.value?.trin:id==='breadth'?history.value?.breadth:id==='wvf'?indicators.value.wvf:id==='vpc'?indicators.value.vpc:id==='trend'?indicators.value.trend:id==='erp'?history.value?.erp:id==='bond'?history.value?.bond:(history.value?.valuation?.series || []).map((r:any)=>({...r,value:r.pe}))
-  const name=['wvf','trend','vpc'].includes(id)?definition.name+' · '+primaryName.value:id==='valuation'?definition.name+' · '+(history.value?.valuation?.name || ''):definition.name
-  return {...definition,name:id==='breadth' && period.value!=='d'?name+'（日均）':name,rows:rows || [],...(id==='valuation'?{statistics:history.value?.valuation?.statistics}:{})}
+  const rows=id==='trin'?history.value?.trin:id==='breadth'?history.value?.breadth:id==='wvf'?indicators.value.wvf:id==='vpc'?indicators.value.vpc:id==='trend'?indicators.value.trend:id==='erp'?history.value?.erp:id==='bond'?history.value?.bond:(valuation.value?.series || []).map((r:any)=>({...r,value:r.pe}))
+  const name=['wvf','trend','vpc'].includes(id)?definition.name+' · '+primaryName.value:id==='valuation' && valuation.value?definition.name+' · '+valuation.value.name:definition.name
+  return {...definition,name:id==='breadth' && period.value!=='d'?name+'（日均）':name,rows:rows || [],...(id==='valuation'?{statistics:valuation.value?.statistics}:{})}
 }))
 const viewKey=computed(()=>JSON.stringify([prefs.market_mode,selected.value,primary.value,period.value,prefs.valuation_symbol,prefs.valuation_years]))
 async function chooseMode(mode:string){prefs.market_mode=mode;await save()}
@@ -123,13 +126,14 @@ onBeforeUnmount(()=>{disposed=true;clearInterval(timer);document.removeEventList
         </div>
         <div v-if="hasValuation" class="workspace-valuation">
           <div class="market-valuation-top"><label>估值指数<select v-model="prefs.valuation_symbol" aria-label="估值指数" @change="save"><option v-for="entry in state?.valuation_catalog || []" :key="entry.symbol" :value="entry.symbol">{{ entry.name }}</option></select></label><label>统计区间<select v-model.number="prefs.valuation_years" aria-label="估值统计区间" @change="save"><option :value="10">近十年</option><option :value="0">全部历史</option></select></label><button class="button secondary" :disabled="busy || state?.progress.running" @click="sync('valuation')">更新估值</button><button class="button secondary" :disabled="busy || state?.progress.running" @click="sync('valuation_history')">补齐估值历史</button></div>
-          <div v-if="history?.valuation?.statistics" class="valuation-stats"><span>PE-TTM <strong>{{ Number(history.valuation.statistics.latest).toFixed(2) }} 倍</strong></span><span>历史分位 <strong>{{ Number(history.valuation.statistics.percentile).toFixed(1) }}%</strong></span><span>均值 {{ Number(history.valuation.statistics.mean).toFixed(2) }} 倍 · σ {{ Number(history.valuation.statistics.std).toFixed(2) }}</span></div>
-          <p v-if="state?.valuation_error" class="market-error" role="status">{{ state.valuation_error }}</p><div v-if="history?.valuation?.coverage" class="market-data-row"><span>{{ history.valuation.coverage.first }} — {{ history.valuation.coverage.last }}</span><span v-if="!history.valuation.coverage.ten_years">历史尚不足十年，等待补齐</span><a :href="history.valuation.source_url" target="_blank" rel="noreferrer">数据来源</a></div>
+          <div v-if="valuation?.statistics" class="valuation-stats"><span>PE-TTM <strong>{{ Number(valuation.statistics.latest).toFixed(2) }} 倍</strong></span><span>历史分位 <strong>{{ Number(valuation.statistics.percentile).toFixed(1) }}%</strong></span><span>均值 {{ Number(valuation.statistics.mean).toFixed(2) }} 倍 · σ {{ Number(valuation.statistics.std).toFixed(2) }}</span></div>
+          <p v-if="state?.preferences.valuation_symbol===prefs.valuation_symbol && state?.valuation_error" class="market-error" role="status">{{ state.valuation_error }}</p><div v-if="valuation?.coverage" class="market-data-row"><span>{{ valuation.coverage.first }} — {{ valuation.coverage.last }}</span><span v-if="!valuation.coverage.ten_years">按已有历史统计</span><a :href="valuation.source_url" target="_blank" rel="noreferrer">数据来源</a></div>
         </div>
       </fieldset>
       <MarketWorkspaceChart v-if="history" :metrics="metrics" :bars="bars" :index-name="primaryName" :index-mode="prefs.index_overlay" :period="period" :view-key="viewKey" :volume="prefs.volume_enabled" :ma="prefs.ma_enabled" :ma-periods="prefs.ma_periods" />
       <div v-else class="panel empty-chart">正在读取市场缓存…</div>
-      <p v-if="prefs.market_mode==='long' && state?.erp_error" class="market-error" role="status">{{ state.erp_error }}</p>
+      <p v-if="hasERP && state?.erp_error" class="market-error" role="status">{{ state.erp_error }}</p>
+      <p v-else-if="hasBond && state?.bond_error" class="market-error" role="status">{{ state.bond_error }}</p>
     </section>
     <!-- 独立指数模块暂时停用，保留原实现。
     <section class="market-section" aria-label="指数走势"><div class="market-section-heading"><h2>指数走势</h2></div>

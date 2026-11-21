@@ -69,6 +69,9 @@ def _query(action, payload, budget=None):
     if action in {'market_reference_index','market_reference_bond'}:
         from .market_reference import query as reference_query
         return reference_query('index' if action=='market_reference_index' else 'bond',payload,now().date().isoformat())
+    if action=='market_valuation_daily':
+        from .market_reference import query_valuation
+        return query_valuation(payload,now().date().isoformat())
     if action=='market_static_history':
         from .market_archive import query as archive_query
         return archive_query(payload,now().date().isoformat())
@@ -79,7 +82,9 @@ def _query(action, payload, budget=None):
     if action=='market_erp_bond':
         import akshare as ak
         frame=ak.bond_china_yield(start_date=payload['start'].replace('-',''),end_date=payload['end'].replace('-',''))
-        records=[{'date':str(r['日期'])[:10],'yield10':r['10年'],'source':'中债 / 中国10年期国债收益率'} for r in _records(frame) if str(r.get('曲线名称','')) in {'中债国债收益率曲线','国债收益率曲线'}]
+        records=[{'date':str(r['日期'])[:10],'yield10':r['10年'],'source':'中债 / 中国10年期国债收益率'} for r in _records(frame)
+                 if str(r.get('曲线名称','')) in {'中债国债收益率曲线','国债收益率曲线'}
+                 and payload['start']<=str(r['日期'])[:10]<=payload['end'] and r.get('10年') is not None]
         if not records:raise ValueError('未取得明确的中国10年期国债曲线')
         return records
     if action=='market_erp_bond_em':

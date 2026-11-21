@@ -1,5 +1,6 @@
 """Read public InvestmentQuant datasets without executing third-party code."""
 import csv
+import json
 from datetime import date
 from io import BytesIO,StringIO
 import math
@@ -7,7 +8,16 @@ import math
 BASE='https://ron-wang.github.io/InvestmentQuant/'
 REPOSITORY='https://github.com/Ron-Wang/InvestmentQuant'
 INDICES={'sh000300':('沪深300','analysis-hs300-erp/000300_CSI_quote_history.csv'),
+         'sh000001':('上证指数',None),
+         'sz399102':('创业板综指',None),
+         'sh000688':('科创50',None),
          'sz399986':('中证银行','analysis-bank-value/399986_CSI_quote_history.csv')}
+CSI_START={'sh000300':'2005-04-08','sz399986':'2013-07-15'}
+CSI_API='https://www.csindex.com.cn/csindex-home/perf/index-perf'
+CSI_SOURCE='中证指数官网 / 滚动市盈率'
+ENIU_SOURCE='亿牛网 / 指数滚动市盈率'
+ENIU_BASE='https://eniu.com/'
+CHINABOND_URL='https://yield.chinabond.com.cn/cbweb-pbc-web/pbc/historyQuery'
 BOND_PATH='analysis-hs300-erp/国债及其他债券收益率曲线.xlsx'
 PE_SOURCE='InvestmentQuant / CSI PE-TTM'
 BOND_SOURCE='InvestmentQuant / 中债10年国债'
@@ -75,8 +85,8 @@ def parse_index(data,symbol,today):
 
 def save_quotes(db,symbol,records,today):
     """Reuse verified CSI daily quotes; preserve every existing market bar."""
-    if symbol!='sh000300':return
-    values=[(symbol,r['date'],r['open'],r['high'],r['low'],r['close'],r['volume'],PE_SOURCE)
+    if symbol not in CSI_START:return
+    values=[(symbol,r['date'],r['open'],r['high'],r['low'],r['close'],r['volume'],r.get('source',PE_SOURCE))
             for r in records if all(k in r for k in ['open','high','low','close','volume'])]
     count=db.executemany('INSERT OR IGNORE INTO index_bars VALUES(?,?,?,?,?,?,?,?)',values).rowcount
     if count:
@@ -84,6 +94,63 @@ def save_quotes(db,symbol,records,today):
         old=db.execute('SELECT source FROM index_info WHERE symbol=?',(symbol,)).fetchone()
         bounds=db.execute('SELECT MIN(date),MAX(date) FROM index_bars WHERE symbol=?',(symbol,)).fetchone()
         db.execute('INSERT OR REPLACE INTO index_info VALUES(?,?,?,?,?)',(symbol,old[0] if old else 'CSI 静态历史补缺 / 本地缓存',*bounds,now().isoformat()))
+
+
+def index_source_url(symbol,source):
+    if source==ENIU_SOURCE:return ENIU_BASE+'gu/'+symbol
+    if source==CSI_SOURCE:return 'https://www.csindex.com.cn/#/indices/family/detail?indexCode='+symbol[2:]
+    return REPOSITORY
+
+
+def parse_valuation(data,symbol,start,end):
+    csi=symbol in CSI_START
+    if csi:
+        if not isinstance(data,dict) or str(data.get('code'))!='200' or not isinstance(data.get('data'),list):
+            raise ValueError('中证指数未返回估值数据')
+        raw=[(row.get('tradeDate'),row.get('peg'),row.get('close'),row) for row in data['data']
+             if isinstance(row,dict) and row.get('indexCode')==symbol[2:]]
+    else:
+        if not isinstance(data,dict) or any(not isinstance(data.get(k),list) for k in ('date','pe','close')):
+            raise ValueError('亿牛网未返回估值数据')
+        raw=[(*row,None) for row in zip(data['date'],data['pe'],data['close'],strict=True)]
+    records={}
+    for day,pe,close,quote in raw:
+        try:
+            observed=date.fromisoformat(day);day=observed.isoformat()
+            if not start<=day<=end or observed.weekday()>=5:continue
+            pe,close=float(pe),float(close)
+            if not all(math.isfinite(n) and n>0 for n in (pe,close)):continue
+            row={'date':day,'pe':pe,'close':close,'source':CSI_SOURCE if csi else ENIU_SOURCE}
+            if quote:
+                try:
+                    o,h,l,v=(float(quote[k]) for k in ('open','high','low','tradingVol'))
+                    if all(math.isfinite(n) for n in (o,h,l,v)) and 0<l<=min(o,close)<=max(o,close)<=h and v>=0:
+                        row.update(open=o,high=h,low=l,volume=v)
+                except (KeyError,ValueError,TypeError):pass
+            records[day]=row
+        except (ValueError,TypeError):continue
+    if not records:raise ValueError('所选时间内没有有效的 PE-TTM')
+    return [records[day] for day in sorted(records)]
+
+
+def query_valuation(payload,today):
+    import requests
+    symbol=payload['symbol'];start=payload['start'];end=min(today,payload['end'])
+    if symbol not in INDICES:raise ValueError('不支持此指数的估值数据')
+    if symbol in CSI_START:
+        url=CSI_API
+        params={'indexCode':symbol[2:],'startDate':start.replace('-',''),'endDate':end.replace('-','')}
+    else:
+        recent=(date.fromisoformat(end)-date.fromisoformat(start)).days<=60
+        url=ENIU_BASE+'chart/peindex/'+symbol+'/t/'+('3' if recent else 'all')
+        params={}
+    with requests.get(url,params=params,headers={'User-Agent':'AssetGrove','Accept':'application/json'},timeout=30,stream=True) as response:
+        response.raise_for_status()
+        body=bytearray()
+        for chunk in response.iter_content(65536):
+            body.extend(chunk)
+            if len(body)>4*1024*1024:raise ValueError('指数估值数据超过大小上限')
+    return parse_valuation(json.loads(body),symbol,start,end)
 
 
 def parse_bond(data,today):

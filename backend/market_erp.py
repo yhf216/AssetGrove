@@ -1,6 +1,7 @@
 """CSI 300 trailing earnings yield minus Chinese ten-year government yield."""
 import math
 from datetime import date
+from .market_reference import CSI_SOURCE,PE_SOURCE,BOND_SOURCE
 
 SCHEMA='''
 CREATE TABLE IF NOT EXISTS erp_pe(date TEXT PRIMARY KEY,pe REAL NOT NULL,source TEXT NOT NULL);
@@ -31,9 +32,12 @@ def save_component(db,kind,records,today):
             values.append((day,value,str(row['source'])))
         except (ValueError,KeyError,TypeError):continue
     if not values:raise ValueError('ERP 数据为空或无有效数值')
+    protected='AND NOT (erp_pe.source=? AND excluded.source=?)' if kind=='pe' else 'AND NOT (excluded.source=? AND erp_bond.source<>?)'
+    sources=(CSI_SOURCE,PE_SOURCE) if kind=='pe' else (BOND_SOURCE,BOND_SOURCE)
     db.executemany(f'''INSERT INTO {table} VALUES(?,?,?) ON CONFLICT(date) DO UPDATE SET
         {column}=excluded.{column},source=excluded.source
-        WHERE {table}.{column} IS NOT excluded.{column} OR {table}.source IS NOT excluded.source''',values)
+        WHERE ({table}.{column} IS NOT excluded.{column} OR {table}.source IS NOT excluded.source) {protected}''',
+        [(*row,*sources) for row in values])
 
 
 def calculate_pending(db,limit=128):
