@@ -76,5 +76,7 @@
 .workspace-plot { padding:1rem 1rem .7rem; min-width:0; }
 .workspace-chart-scroll { overflow-x:auto; min-width:0; }
 .workspace-chart { width:100%; height:clamp(35rem,68vh,48rem); }
+.workspace-time-scope { display:flex; justify-content:center; gap:1rem; }
+.workspace-time-scope [aria-pressed="true"] { color:var(--text); font-weight:700; text-decoration:underline; text-underline-offset:.25em; }
 .workspace-missing { padding:.7rem .4rem 0; }
 @media(max-width:950px) { .workspace-controls,.workspace-plot { padding:.75rem; } .workspace-tabs { width:100%; } .workspace-tabs button { flex:1; } }
