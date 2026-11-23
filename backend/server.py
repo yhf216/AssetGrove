@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 
 from .ledger import (build_state, cents, confirm_dividend, decimal, delete_account, delete_transaction, iso_date,
                      replay, run_cashflows, save_account, save_transaction, security_name, symbol_code, uid,
-                     is_etf, preference, set_preference, security_snapshot)
+                     is_etf, market_prefix, preference, set_preference, security_snapshot)
 from .providers import apply_result, evaluate_rules, fetch, status
 from .storage import Database, audit, now, rows
 from .network import configure_direct_network
@@ -30,6 +30,7 @@ from .market import MarketStore, MarketService
 from .market_network import MarketBudget,MarketLimit
 from .sync_schedule import automatic_slot
 from .quote_batch import BATCH_SIZE
+from .stock_listing import valid_stock_code
 
 BACKUP_TABLES = ['meta','accounts','securities','transactions','watchlist','quotes','daily_prices','dividends','entitlements','rules','notifications','cashflows','flow_runs']
 
@@ -44,10 +45,11 @@ def emit(message):
         sys.stdout.flush()
 
 class Service:
-    def __init__(self,database,network_path=None):
+    def __init__(self,database,network_path=None,market_store=None):
         self.db = database
         self.network_path=str(network_path or database.path.parent/'market.sqlite3')
         self.network=MarketBudget(self.network_path,'daily')
+        self.market_store=market_store
         self.busy = threading.Lock()
         self.stop = threading.Event()
         self.last_quotes = 0.0
@@ -59,9 +61,13 @@ class Service:
         self.opening_rules = set()
 
     def opened(self):
+        delistings=self.delistings()
         with self.db.connect() as db:
             self.opening_rules = {r['id'] for r in rows(db,'SELECT id FROM rules WHERE enabled=1')}
-            evaluate_rules(db,emit,self.opening_rules)
+            evaluate_rules(db,emit,self.opening_rules,delistings)
+
+    def delistings(self):
+        return self.market_store.delistings(now().date().isoformat()) if self.market_store else {}
 
     def sync(self, full=False, symbols=None, manual=True, automatic=None):
         if not self.busy.acquire(blocking=False):
@@ -88,24 +94,41 @@ class Service:
                     response=fetch(action,{**payload,'_market_cache':self.network_path,'_market_manual':manual},timeout=timeout,cancel=self.stop)
                     if response.get('limited'):raise MarketLimit(response['error'],response['retry_at'],response.get('source',''))
                     return response
-                for offset in range(0,len(tracked),BATCH_SIZE):
+                delistings=self.delistings()
+                if self.market_store and full:
+                    exchanges={market_prefix(symbol) for symbol in tracked if symbol not in delistings
+                               and valid_stock_code(market_prefix(symbol)+'.'+symbol)}
+                    for exchange in sorted(exchanges):
+                        if self.stop.is_set():return
+                        try:error=self.market_store.refresh_delistings(exchange,request)
+                        except MarketLimit as exc:
+                            if not exc.source:raise
+                            error=str(exc)
+                        with self.db.connect() as db:
+                            if error:status(db,'delistings:'+exchange,error)
+                            elif self.market_store.setting('delistings_synced_'+exchange)==today:
+                                status(db,'delistings:'+exchange,'已核对 · '+today)
+                    delistings=self.delistings()
+                active=[symbol for symbol in tracked if symbol not in delistings]
+                for offset in range(0,len(active),BATCH_SIZE):
                     if self.stop.is_set():return
-                    batch=tracked[offset:offset+BATCH_SIZE]
-                    result=request('quote_batch',{'symbols':[('sh' if s.startswith(('5','6')) else 'sz')+s for s in batch]})
+                    batch=active[offset:offset+BATCH_SIZE]
+                    result=request('quote_batch',{'symbols':[market_prefix(s)+s for s in batch]})
+                    delistings=self.delistings()
                     with self.db.connect() as db:
                         if result['ok']:
                             for quote in result['data']:
-                                if Decimal(quote['price'])<=0:continue
+                                if quote['symbol'] in delistings or Decimal(quote['price'])<=0:continue
                                 apply_result(db,'ak_quote',quote['symbol'],{'ok':True,'data':quote})
                                 if quote['timestamp_verified'] and quote['as_of'][11:16]>='15:00':
                                     db.execute('INSERT OR REPLACE INTO daily_prices VALUES(?,?,?,?)',(quote['symbol'],quote['as_of'][:10],quote['price'],quote['source']))
                         else:status(db,'quote_batch','失败 · '+result.get('error','批量报价失败'))
-                        evaluate_rules(db,emit,self.opening_rules)
+                        evaluate_rules(db,emit,self.opening_rules,delistings)
                 actions=[]
                 history_starts={}
-                if cached.get('cache:calendar','')<str(now().date()-timedelta(days=5)):
-                    actions.append(('bao_calendar',tracked[0] if tracked else '600036'))
-                for symbol in tracked if full else []:
+                if active and cached.get('cache:calendar','')<str(now().date()-timedelta(days=5)):
+                    actions.append(('bao_calendar',active[0]))
+                for symbol in active if full else []:
                     history='ak_etf_history' if is_etf(symbol) else 'bao_history'
                     last=date.fromisoformat(latest[symbol]) if symbol in latest else None
                     day=last+timedelta(days=1) if last else now().date()-timedelta(days=365)
@@ -128,10 +151,28 @@ class Service:
                         with self.db.connect() as db:
                             apply_result(db,action,symbol,result)
                         action, result = 'ak_calendar', request('ak_calendar', {'symbol':symbol})
+                    delistings=self.delistings()
                     with self.db.connect() as db:
                         apply_result(db,action,symbol,result)
                         if result['ok']:status(db,'cache:calendar' if action in {'bao_calendar','ak_calendar'} else 'cache:'+action+':'+symbol,today)
-                        evaluate_rules(db,emit,self.opening_rules)
+                        evaluate_rules(db,emit,self.opening_rules,delistings)
+                if full and not self.stop.is_set():
+                    for symbol in sorted(set(tracked) & delistings.keys()):
+                        end=delistings[symbol]
+                        key=f'cache:delisted_history:{symbol}:{end}'
+                        recent_close=latest.get(symbol,'')
+                        if recent_close<end and recent_close>=str(date.fromisoformat(end)-timedelta(days=7)):continue
+                        attempt=key+':attempt'
+                        if cached.get(key) or cached.get(attempt,'')>str(now().date()-timedelta(days=7)) or self.stop.is_set():continue
+                        start=(date.fromisoformat(end)-timedelta(days=365)).isoformat()
+                        with self.db.connect() as db:status(db,attempt,today)
+                        result=request('bao_history',{'symbol':symbol,'start':start,
+                                       'end':(date.fromisoformat(end)-timedelta(days=1)).isoformat()},timeout=180)
+                        if result['ok']:
+                            result['data']=[r for r in result['data'] if start<=r.get('date','')<end]
+                        with self.db.connect() as db:
+                            apply_result(db,'bao_history',symbol,result)
+                            if result['ok'] and result['data']:status(db,key,today)
                 self.last_quotes = time.monotonic()
                 if full and symbols is None:
                     self.last_full = now().date().isoformat()
@@ -156,11 +197,12 @@ class Service:
 
     def tick(self,moment=None):
         moment=moment or now()
+        delistings=self.delistings()
         with self.db.connect() as db:
             status(db,'scheduler_last_tick',moment.isoformat())
-            run_cashflows(db);build_state(db)
+            run_cashflows(db);build_state(db,delistings)
             tracked=db.execute("SELECT 1 FROM watchlist UNION SELECT 1 FROM rules WHERE enabled=1 UNION SELECT 1 FROM transactions WHERE symbol<>'' LIMIT 1").fetchone()
-            evaluate_rules(db,emit,self.opening_rules)
+            evaluate_rules(db,emit,self.opening_rules,delistings)
             trading=db.execute('SELECT value FROM sync_status WHERE key=?',('trading_day:'+moment.date().isoformat(),)).fetchone()
             previous=db.execute("SELECT value FROM sync_status WHERE key='automatic_slot'").fetchone()
         slot=automatic_slot(moment,int(trading[0]) if trading else None)
@@ -179,7 +221,7 @@ def create_app(database=None, token=None, background=True):
     token = token or secrets.token_urlsafe(32)
     market_base = database.path.parent if injected_database else Path(os.getenv('ASSETGROVE_DATA_DIR') or app_directory()/'data')
     market = MarketService(MarketStore(market_base/'market.sqlite3'))
-    service = Service(database,market.store.path)
+    service = Service(database,market.store.path,market.store)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -253,8 +295,9 @@ def create_app(database=None, token=None, background=True):
 
     @app.get('/api/state',dependencies=[Depends(auth)])
     def state():
+        delistings=service.delistings()
         with database.connect() as db:
-            result = build_state(db)
+            result = build_state(db,delistings)
             result['data_path'] = str(database.path)
             result['network_mode'] = 'direct'
             settings = read_settings()
@@ -317,24 +360,29 @@ def create_app(database=None, token=None, background=True):
     @app.post('/api/securities/prepare',dependencies=[Depends(auth)])
     def prepare_security(body:dict):
         symbol = symbol_code(body.get('symbol',''))
+        delisted_on=service.delistings().get(symbol)
         with database.connect() as db:
             db.execute('INSERT INTO securities VALUES(?,?) ON CONFLICT(symbol) DO NOTHING', (symbol, security_name(db,symbol,body.get('name',''))))
-            result = security_snapshot(db,symbol)
+            result = security_snapshot(db,symbol,delisted_on)
         return result
 
     @app.get('/api/security/{symbol}',dependencies=[Depends(auth)])
     def security_details(symbol:str):
+        symbol=symbol_code(symbol)
+        delisted_on=service.delistings().get(symbol)
         with database.connect() as db:
-            return security_snapshot(db, symbol_code(symbol))
+            return security_snapshot(db,symbol,delisted_on)
 
     @app.get('/api/securities/search',dependencies=[Depends(auth)])
     def search_securities(q:str=''):
         q = q.strip()[:30]
+        delistings=service.delistings()
         with database.connect() as db:
-            return rows(db,'''SELECT symbol,MAX(name) name FROM (
+            matches=rows(db,'''SELECT symbol,MAX(name) name FROM (
                 SELECT symbol,name FROM securities UNION ALL SELECT symbol,name FROM security_catalog
                 ) WHERE symbol LIKE ? OR name LIKE ? GROUP BY symbol
                 ORDER BY CASE WHEN symbol=? OR name=? THEN 0 ELSE 1 END,symbol LIMIT 20''',(q+'%','%'+q+'%',q,q))
+        return [{**r,'delisted_on':delistings.get(r['symbol'])} for r in matches]
 
     @app.delete('/api/accounts/{account_id}',dependencies=[Depends(auth)])
     def remove_account(account_id:str):
@@ -386,6 +434,7 @@ def create_app(database=None, token=None, background=True):
 
     def save_rule(body:dict, rid=None):
         symbol = symbol_code(body.get('symbol',''))
+        delistings=service.delistings()
         price, yield_value = body.get('target_price'),body.get('target_yield')
         price = str(decimal(price,True)) if price not in (None,'') else None
         yield_value = str(decimal(yield_value,True)) if yield_value not in (None,'') else None
@@ -403,13 +452,15 @@ def create_app(database=None, token=None, background=True):
             before = db.execute('SELECT * FROM rules WHERE id=?',(rid,)).fetchone() if rid else None
             if rid and not before:
                 raise ValueError('关注条件不存在，请刷新后重试')
+            if symbol in delistings and (not before or before['symbol']!=symbol):
+                raise ValueError('该股票已退市，无法新增行情提醒')
             if rid:
                 db.execute('UPDATE rules SET symbol=?,target_price=?,target_yield=?,basis=?,mode=?,triggered=0 WHERE id=?',(symbol,price,yield_value,basis,mode,rid))
             else:
                 rid = uid()
                 db.execute('INSERT INTO rules VALUES(?,?,?,?,?,?,1,0)',(rid,symbol,price,yield_value,basis,mode))
             audit(db,'update' if before else 'create','rule:'+rid,dict(before) if before else None,body)
-            evaluate_rules(db, emit, {rid})
+            evaluate_rules(db, emit, {rid},delistings)
         return {'ok':True,'id':rid}
 
     @app.post('/api/rules',dependencies=[Depends(auth)])
@@ -461,8 +512,10 @@ def create_app(database=None, token=None, background=True):
 
     @app.get('/api/history/{symbol}',dependencies=[Depends(auth)])
     def history(symbol:str):
+        symbol=symbol_code(symbol)
+        delisted_on=service.delistings().get(symbol)
         with database.connect() as db:
-            return rows(db,'SELECT date,close FROM daily_prices WHERE symbol=? ORDER BY date',(symbol_code(symbol),))
+            return rows(db,'SELECT date,close FROM daily_prices WHERE symbol=? AND (? IS NULL OR date<?) ORDER BY date',(symbol,delisted_on,delisted_on))
 
     @app.get('/api/export',dependencies=[Depends(auth)])
     def export():

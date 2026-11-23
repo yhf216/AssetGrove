@@ -95,21 +95,29 @@ def _query(action, payload, budget=None):
         response.raise_for_status();result=response.json().get('result')
         if not result or int(result.get('pages',1))>1:raise ValueError('国债区间未完整返回，保留缓存等待重试')
         return [{'date':str(r['SOLAR_DATE'])[:10],'yield10':r['EMM00166466'],'source':'东方财富 / 中国10年期国债收益率'} for r in result['data'] if payload['start']<=str(r['SOLAR_DATE'])[:10]<=payload['end']]
+    if action=='market_delistings':
+        from .stock_listing import exchange_delistings
+        return exchange_delistings(payload['exchange'])
     if action=='market_universe_ak':
         import akshare as ak
+        from .stock_listing import exchange_delistings, listing_date, valid_stock_code
         result={}
-        sources=[(ak.stock_info_sh_name_code(symbol='主板A股'),'证券代码','证券简称','上市日期',None,'sh'),
-                 (ak.stock_info_sh_name_code(symbol='科创板'),'证券代码','证券简称','上市日期',None,'sh'),
-                 (ak.stock_info_sz_name_code(symbol='A股列表'),'A股代码','A股简称','A股上市日期',None,'sz'),
-                 (ak.stock_info_sh_delist(),'公司代码','公司简称','上市日期','暂停上市日期','sh'),
-                 (ak.stock_info_sz_delist(),'证券代码','证券简称','上市日期','终止上市日期','sz')]
-        for frame,code_key,name_key,ipo_key,out_key,exchange in sources:
+        sources=[(ak.stock_info_sh_name_code(symbol='主板A股'),'证券代码','证券简称','上市日期','sh'),
+                 (ak.stock_info_sh_name_code(symbol='科创板'),'证券代码','证券简称','上市日期','sh'),
+                 (ak.stock_info_sz_name_code(symbol='A股列表'),'A股代码','A股简称','A股上市日期','sz')]
+        for frame,code_key,name_key,ipo_key,exchange in sources:
             for r in _records(frame):
-                code=str(r[code_key]).zfill(6)
-                if not re.fullmatch(r'(60|68|00|30)\d{4}',code):continue
-                ipo=str(r[ipo_key])[:10]
-                if len(ipo)!=10 or ipo in {'None','NaT'}:raise ValueError('上市日期缺失，无法证明历史样本覆盖')
-                result[exchange+'.'+code]={'code':exchange+'.'+code,'code_name':str(r[name_key]),'ipoDate':ipo,'outDate':str(r[out_key])[:10] if out_key and r.get(out_key) else ''}
+                code=exchange+'.'+str(r[code_key]).zfill(6)
+                if not valid_stock_code(code):continue
+                ipo=listing_date(r[ipo_key])
+                if not ipo:raise ValueError('上市日期缺失，无法证明历史样本覆盖')
+                result[code]={'code':code,'code_name':str(r[name_key]),'ipoDate':ipo,'outDate':''}
+        for exchange in ('sh','sz'):
+            for record in exchange_delistings(exchange):
+                code=record['code']
+                previous=result.get(code)
+                if not previous or previous['ipoDate']<record['outDate']:
+                    result[code]={**record,'exchange_confirmed':True}
         return list(result.values())
     if action=='market_calendar_ak':
         import akshare as ak

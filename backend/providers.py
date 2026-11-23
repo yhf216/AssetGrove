@@ -217,7 +217,7 @@ def _fetch(action, payload):
             if action == 'bao_catalog':
                 return consume(bs.query_stock_basic())
             if action == 'bao_history':
-                return consume(bs.query_history_k_data_plus(code, 'date,code,close', start_date=payload.get('start', (now().date()-timedelta(days=365)).isoformat()), end_date=now().date().isoformat(), frequency='d', adjustflag='3'))
+                return consume(bs.query_history_k_data_plus(code, 'date,code,close', start_date=payload.get('start', (now().date()-timedelta(days=365)).isoformat()), end_date=payload.get('end',now().date().isoformat()), frequency='d', adjustflag='3'))
             if action == 'bao_minute':
                 return consume(bs.query_history_k_data_plus(code, 'date,time,code,close', start_date=now().date().isoformat(), end_date=now().date().isoformat(), frequency='5', adjustflag='3'))
             if action == 'bao_dividends':
@@ -442,9 +442,13 @@ def usable_rule_quote(db, quote, moment, opening=False):
     return bool(latest and stamp.date().isoformat() == latest[0] and stamp.strftime('%H:%M') >= '14:45' and age <= 40*86400)
 
 
-def evaluate_rules(db, emit=lambda value: None, opening_ids=None):
+def evaluate_rules(db, emit=lambda value: None, opening_ids=None, delistings=None):
     moment = now()
     for r in rows(db,'SELECT * FROM rules WHERE enabled=1'):
+        if delistings and r['symbol'] in delistings:
+            if r['triggered']:db.execute('UPDATE rules SET triggered=0 WHERE id=?',(r['id'],))
+            if opening_ids is not None:opening_ids.discard(r['id'])
+            continue
         opening = opening_ids is not None and r['id'] in opening_ids
         q = db.execute('SELECT * FROM quotes WHERE symbol=?',(r['symbol'],)).fetchone()
         if not usable_rule_quote(db,q,moment,opening):

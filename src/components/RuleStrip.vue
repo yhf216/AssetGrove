@@ -5,7 +5,7 @@ import { Trash2, Pencil, GripVertical } from 'lucide-vue-next'
 const props = defineProps<{ rule:any; stock?:any; name:string; basisLabel:string }>()
 defineEmits<{ remove:[]; edit:[]; dragstart:[event:DragEvent]; dragend:[]; move:[step:number] }>()
 const current = computed(() => Number(props.stock?.quote?.price) || null)
-const dps = computed(() => props.stock?.dps?.[props.rule.basis])
+const dps = computed(() => props.stock?.delisted_on ? null : props.stock?.dps?.[props.rule.basis])
 const yieldNow = computed(() => props.stock?.yields?.[props.rule.basis])
 const target = computed(() => {
   const byYield = Number(props.rule.target_yield) > 0 && dps.value > 0 ? dps.value / Number(props.rule.target_yield) * 100 : null
@@ -44,8 +44,8 @@ const fresh = computed(() => {
         <span class="price-marker current-marker" :style="{left:position(current)+'%'}"><i></i><span>当前 {{ money(current) }}</span></span>
         <span class="price-marker target-marker" :style="{left:position(target)+'%'}"><i></i><span>目标 {{ money(target) }}</span></span>
       </div>
-      <span class="rule-distance">{{ difference == null ? '等待价格与分红资料' : `目标较当前 ${difference > 0 ? '+' : ''}${percent(difference)}` }}</span>
+      <span v-if="!stock?.delisted_on" class="rule-distance">{{ difference == null ? '等待价格与分红资料' : `目标较当前 ${difference > 0 ? '+' : ''}${percent(difference)}` }}</span>
     </div>
-    <div class="rule-actions"><span class="tag">{{ rule.triggered ? '条件达标' : fresh ? '监控中' : stock?.quote?.timestamp_verified ? '缓存行情' : '等待有效行情' }}</span><div class="rule-edit-actions"><button class="icon-button rule-drag" draggable="true" :aria-label="'拖动排序 '+rule.symbol" title="拖动排序；方向键调整位置" @dragstart="$emit('dragstart',$event)" @dragend="$emit('dragend')" @keydown.up.prevent="$emit('move',-1)" @keydown.down.prevent="$emit('move',1)"><GripVertical :size="17" /></button><button class="icon-button" :aria-label="'编辑关注条件 '+rule.symbol" @click="$emit('edit')"><Pencil :size="17" /></button><button class="icon-button" aria-label="删除关注条件" @click="$emit('remove')"><Trash2 :size="17" /></button></div></div>
+    <div class="rule-actions"><span class="tag">{{ stock?.delisted_on ? '已退市 · 提醒暂停' : rule.triggered ? '条件达标' : fresh ? '监控中' : stock?.quote?.timestamp_verified ? '缓存行情' : '等待有效行情' }}</span><div class="rule-edit-actions"><button class="icon-button rule-drag" draggable="true" :aria-label="'拖动排序 '+rule.symbol" title="拖动排序；方向键调整位置" @dragstart="$emit('dragstart',$event)" @dragend="$emit('dragend')" @keydown.up.prevent="$emit('move',-1)" @keydown.down.prevent="$emit('move',1)"><GripVertical :size="17" /></button><button class="icon-button" :aria-label="'编辑关注条件 '+rule.symbol" @click="$emit('edit')"><Pencil :size="17" /></button><button class="icon-button" aria-label="删除关注条件" @click="$emit('remove')"><Trash2 :size="17" /></button></div></div>
   </article>
 </template>

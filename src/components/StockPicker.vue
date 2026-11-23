@@ -5,7 +5,7 @@ import { api } from '../api'
 const props = defineProps<{ modelValue: string; name?: string }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string]; 'update:name': [value: string] }>()
 const query = ref(props.modelValue && props.name && props.modelValue !== props.name ? `${props.name} ${props.modelValue}` : props.modelValue || '')
-const options = ref<{ symbol: string; name: string }[]>([])
+const options = ref<{ symbol: string; name: string; delisted_on?: string }[]>([])
 const expanded = ref(false), active = ref(0), busy = ref(false)
 let timer: ReturnType<typeof setTimeout>, requestId = 0
 watch(() => props.modelValue, value => {
@@ -49,7 +49,7 @@ onUnmounted(() => { clearTimeout(timer); ++requestId })
     </label>
     <ul v-if="expanded && (options.length || busy)" id="stock-options" class="stock-options" role="listbox">
       <li v-if="busy" role="presentation">搜索中…</li>
-      <li v-for="(option, index) in options" :id="'stock-option-' + index" :key="option.symbol" role="option" :aria-selected="active === index" @mousedown.prevent="choose(option)"><strong>{{ option.name }}</strong><span>{{ option.symbol }}</span></li>
+      <li v-for="(option, index) in options" :id="'stock-option-' + index" :key="option.symbol" role="option" :aria-selected="active === index" @mousedown.prevent="choose(option)"><strong>{{ option.name }}</strong><span>{{ option.symbol }}{{ option.delisted_on ? ' · 已退市' : '' }}</span></li>
     </ul>
   </div>
 </template>

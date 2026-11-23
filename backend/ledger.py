@@ -315,32 +315,55 @@ def dps_for(db, symbol, basis='ttm'):
     selected = [e for e in events if e['report_year'] is not None and today.year-years <= e['report_year'] < today.year]
     return sum((decimal(e['cash_ps']) for e in selected), Decimal(0)) / years
 
-def security_snapshot(db, symbol):
-    quote = db.execute('SELECT * FROM quotes WHERE symbol=?', (symbol,)).fetchone()
-    quote = dict(quote) if quote else None
+def last_trade(db,symbol,delisted_on,quote=None):
+    close = db.execute('SELECT date,close price,source FROM daily_prices WHERE symbol=? AND date<? ORDER BY date DESC LIMIT 1',
+                       (symbol,delisted_on)).fetchone()
+    if quote and quote['timestamp_verified'] and quote['as_of'] and quote['as_of'][:10]<delisted_on:
+        day=quote['as_of'][:10]
+        if not close or (day>close['date'] and quote['as_of'][11:16]>='15:00'):
+            return {'date':day,'price':quote['price'],'source':quote['source']}
+    return dict(close) if close else None
+
+
+def security_snapshot(db, symbol, delisted_on=None):
+    cached = db.execute('SELECT * FROM quotes WHERE symbol=?', (symbol,)).fetchone()
+    quote = dict(cached) if cached and not delisted_on else None
     dps = {basis: dps_for(db, symbol, basis) for basis in ['ttm', 'last_year', 'avg3', 'avg5']}
     return {'symbol': symbol, 'name': security_name(db, symbol), 'quote': quote,
+            'delisted_on':delisted_on,'last_trade':last_trade(db,symbol,delisted_on,cached) if delisted_on else None,
             'instrument': 'etf' if is_etf(symbol) else 'stock',
             'dps': {k: float(v) if v is not None else None for k, v in dps.items()},
             'yields': {k: float(v / decimal(quote['price']) * 100) if quote and v is not None else None for k, v in dps.items()}}
 
 
-def build_state(db):
+def build_state(db, delistings=None):
     reconcile(db)
+    delistings=delistings or {}
     balances = {}
     accounts, holdings = replay(db, balances=balances)
     dividend_basis = preference(db, 'dividend_basis', 'avg3')
     names = {s['symbol']: s['name'] for s in rows(db, 'SELECT * FROM securities')}
     quotes = {q['symbol']: q for q in rows(db, 'SELECT * FROM quotes')}
     stock_value, estimate, estimated_count, missing_dividends = 0, 0, 0, 0
+    delisted_count = 0
     for h in holdings:
-        q = quotes.get(h['symbol'])
+        delisted_on = delistings.get(h['symbol'])
+        cached = quotes.get(h['symbol'])
+        q = None if delisted_on else cached
         h['name'] = names.get(h['symbol'], h['symbol'])
         h['cost'] = money(h.pop('cost_cents'))
         h['average_cost'] = h['cost'] / h['quantity']
         h['quote'] = q
+        h['delisted_on'] = delisted_on
+        h['last_trade'] = last_trade(db,h['symbol'],delisted_on,cached) if delisted_on else None
         h['market_value'] = float(decimal(q['price']) * h['quantity']) if q else None
-        h['reference_value'] = h['market_value'] if q else money(h.pop('reference_cost_cents'))
+        cost_reference = money(h.pop('reference_cost_cents'))
+        h['reference_value'] = None if delisted_on else (h['market_value'] if q else cost_reference)
+        h['instrument'] = 'etf' if is_etf(h['symbol']) else 'stock'
+        if delisted_on:
+            delisted_count += 1
+            h.update(annual_dividend_estimate=None,yield_ttm=None,cost_yield_ttm=None,dividend_yield=None,cost_dividend_yield=None)
+            continue
         stock_value += cents(h['reference_value'])
         estimated_count += int(q is None)
         dps = dps_for(db, h['symbol'], dividend_basis)
@@ -352,7 +375,6 @@ def build_state(db):
         h['cost_yield_ttm'] = float(ttm / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and ttm is not None else None
         h['dividend_yield'] = float(dps / decimal(q['price']) * 100) if q and dps is not None else None
         h['cost_dividend_yield'] = float(dps / decimal(h['average_cost']) * 100) if h['average_cost'] > 0 and dps is not None else None
-        h['instrument'] = 'etf' if is_etf(h['symbol']) else 'stock'
     broker_cash = sum(a['balance_cents'] for a in accounts if a['kind'] == 'broker')
     allocation = {k: sum(a['balance_cents'] for a in accounts if a['kind'] == k) for k in KINDS}
     allocation['cash'] += allocation.pop('broker')
@@ -362,7 +384,7 @@ def build_state(db):
     total = sum(allocation.values())
     for a in accounts:
         a['balance'] = money(a.pop('balance_cents'))
-        a['stock_value'] = sum(h['reference_value'] for h in holdings if h['account_id'] == a['id'])
+        a['stock_value'] = sum(h['reference_value'] or 0 for h in holdings if h['account_id'] == a['id'])
     order = json.loads(preference(db, 'account_order', '[]'))
     ranks = {aid: i for i, aid in enumerate(order)}
     sort_mode = preference(db, 'account_sort', 'manual')
@@ -387,12 +409,17 @@ def build_state(db):
     cash_dates = [t['date'] for t in txs if t['kind'] not in {'buy','sell','opening_position','dividend_record'}]
     start = min([tracking_start]+cash_dates)
     price_dates = {r['date'] for r in rows(db, 'SELECT DISTINCT date FROM daily_prices WHERE date>=?', (start,))}
-    dates = sorted({t['date'] for t in txs if t['date'] >= start} | price_dates | {start, now().date().isoformat()})
+    delisting_dates = {delistings[t['symbol']] for t in txs if t['symbol'] in delistings and delistings[t['symbol']]>=start}
+    dates = sorted({t['date'] for t in txs if t['date'] >= start} | price_dates | delisting_dates | {start, now().date().isoformat()})
     for day in dates[-366:]:
         acc, hs = replay(db, day)
         value = sum(a['balance_cents'] for a in acc)
         approximate = False
         for h in hs:
+            delisted_on=delistings.get(h['symbol'])
+            if delisted_on and day>=delisted_on:
+                approximate=True
+                continue
             quote = db.execute('SELECT close FROM daily_prices WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 1', (h['symbol'], day)).fetchone()
             if day == now().date().isoformat() and h['symbol'] in quotes:
                 value += cents(decimal(quotes[h['symbol']]['price']) * h['quantity'])
@@ -405,13 +432,15 @@ def build_state(db):
     watch = []
     symbols = sorted({w['symbol'] for w in rows(db, 'SELECT * FROM watchlist UNION SELECT symbol FROM rules')} | {h['symbol'] for h in holdings})
     for symbol in symbols:
-        q = quotes.get(symbol)
+        delisted_on=delistings.get(symbol)
+        q = None if delisted_on else quotes.get(symbol)
         yields, dps = {}, {}
         for basis in ['ttm', 'last_year', 'avg3', 'avg5']:
             v = dps_for(db, symbol, basis)
             dps[basis] = float(v) if v is not None else None
             yields[basis] = float(v / decimal(q['price']) * 100) if q and v is not None else None
         watch.append({'symbol': symbol, 'name': names.get(symbol, symbol), 'quote': q, 'yields': yields, 'dps': dps, 'instrument':'etf' if is_etf(symbol) else 'stock',
+                      'delisted_on':delisted_on,'last_trade':last_trade(db,symbol,delisted_on,quotes.get(symbol)) if delisted_on else None,
                       'held': any(h['symbol'] == symbol for h in holdings)})
     for t in txs:
         t['amount'] = money(t['amount'])
@@ -421,6 +450,8 @@ def build_state(db):
     for e in entitlements:
         e['expected_amount'] = money(e['expected_amount'])
     rules = rows(db, 'SELECT * FROM rules ORDER BY rowid')
+    for rule in rules:
+        if rule['symbol'] in delistings:rule['triggered']=0
     rule_order = {rid: i for i, rid in enumerate(json.loads(preference(db, 'rule_order', '[]')))}
     rules.sort(key=lambda r: rule_order.get(r['id'], len(rule_order)))
     return {'today': now().date().isoformat(), 'tracking_start': tracking_start, 'timeline_start':start, 'accounts': accounts, 'holdings': holdings,
@@ -435,7 +466,7 @@ def build_state(db):
                         'broker_cash': money(broker_cash), 'received': money(received), 'annual_estimate': money(estimate),
                         'confirmed_received':money(confirmed_received), 'inferred_received':money(inferred_received),
                         'receipt_missing_dates':missing_receipt_dates(db),
-                        'estimated_positions': estimated_count, 'missing_dividend_positions': missing_dividends,
+                        'estimated_positions': estimated_count, 'missing_dividend_positions': missing_dividends,'delisted_positions':delisted_count,
                         'allocation': {k: money(v) for k,v in allocation.items()}},
             'timeline': timeline, 'monthly_dividends': monthly, 'dividend_years':dividend_years, 'monthly_dividends_by_year':by_year}
 

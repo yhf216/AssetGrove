@@ -22,6 +22,7 @@ from .market_reference import INDICES as VALUATION_INDICES
 from .market_valuation import history as valuation_history, preferred_csi_source, sample as sample_indicator, describe, percentile
 from .market_indicators import price_indicators,volume_price_confirmation
 from .market_breadth import net_advances
+from .stock_listing import listing_date, valid_stock_code
 
 INDICES = [
     {'symbol':'sh000001','name':'上证指数'}, {'symbol':'sz399102','name':'创业板综指'},
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_bars(symbol TEXT,date TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,source TEXT,PRIMARY KEY(symbol,date));
 CREATE TABLE IF NOT EXISTS index_info(symbol TEXT PRIMARY KEY,source TEXT,first_date TEXT,last_date TEXT,updated_at TEXT);
 CREATE TABLE IF NOT EXISTS universe(symbol TEXT PRIMARY KEY,name TEXT,ipo TEXT,out_date TEXT);
+CREATE TABLE IF NOT EXISTS exchange_delistings(symbol TEXT PRIMARY KEY,name TEXT NOT NULL,ipo TEXT NOT NULL,out_date TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS breadth(symbol TEXT,date TEXT,change REAL,volume REAL,trading INTEGER,PRIMARY KEY(symbol,date));
 CREATE INDEX IF NOT EXISTS breadth_date ON breadth(date);
 CREATE TABLE IF NOT EXISTS fetch_ranges(symbol TEXT,start TEXT,end TEXT,PRIMARY KEY(symbol,start,end));
@@ -106,6 +108,7 @@ class MarketStore:
         self.path=Path(path);self.path.parent.mkdir(parents=True,exist_ok=True)
         self.lock=threading.RLock()
         self.calculation_lock=threading.Lock()
+        self.delisting_lock=threading.Lock()
         self.history_cache=OrderedDict();self.cached_revision=-1
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
@@ -185,21 +188,88 @@ class MarketStore:
         with self.connect() as db:
             return bool(db.execute('SELECT 1 FROM trin LIMIT 1').fetchone() or db.execute('SELECT 1 FROM breadth LIMIT 1').fetchone())
 
-    def replace_universe(self,records):
-        values=[(r['code'],r['code_name'],r.get('ipoDate') or '1990-01-01',r.get('outDate') or '') for r in records]
+    def delistings(self,day):
         with self.connect() as db:
-            old={r['symbol']:(r['ipo'],r['out_date']) for r in rows(db,'SELECT * FROM universe')}
-            new={r[0]:(r[2],r[3]) for r in values}
+            result={r['symbol'].replace('.','')[2:]:r['out_date'] for r in db.execute(
+                "SELECT symbol,out_date FROM universe WHERE out_date<>'' AND out_date<=?",(day,))}
+            result.update({r['symbol'][3:]:r['out_date'] for r in db.execute('''SELECT d.symbol,d.out_date FROM exchange_delistings d
+                LEFT JOIN universe u USING(symbol) WHERE d.out_date<=? AND (u.ipo IS NULL OR u.ipo<d.out_date)''',(day,))})
+        return result
+
+    def refresh_delistings(self,exchange,request):
+        today=now().date().isoformat()
+        key='delistings_checked_'+exchange
+        with self.delisting_lock:
+            if self.setting(key)==today:return
+            try:
+                result=request('market_delistings',{'exchange':exchange},timeout=120)
+            except MarketLimit as exc:
+                if exc.source:self.setting(key,today,write=True)
+                raise
+            if result.get('cancelled'):return
+            self.setting(key,today,write=True)
+            if not result['ok']:return result.get('error','终止上市名单暂不可用')
+            with self.connect() as db:
+                self.save_delistings(db,result['data'])
+            self.setting('delistings_synced_'+exchange,today,write=True)
+
+    def save_delistings(self,db,records):
+        affected={}
+        for r in records:
+            symbol=r['code'];end=listing_date(r.get('outDate'))
+            if not valid_stock_code(symbol) or not end:continue
+            ipo=listing_date(r.get('ipoDate'))
+            db.execute('INSERT OR REPLACE INTO exchange_delistings VALUES(?,?,?,?)',(symbol,r['code_name'],ipo,end))
+            previous=db.execute('SELECT ipo,out_date FROM universe WHERE symbol=?',(symbol,)).fetchone()
+            if previous and previous['ipo']>=end:continue
+            first=previous['ipo'] if previous else ipo
+            if not first or first>=end:continue
+            db.execute('INSERT INTO universe VALUES(?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET out_date=excluded.out_date',
+                       (symbol,r['code_name'],first,end))
+            affected[symbol]=(tuple(previous) if previous else None,(first,end))
+        self.enqueue_listing_changes(db,affected)
+
+    @staticmethod
+    def enqueue_listing_changes(db,changes):
+        intervals=[]
+        for previous,current in changes.values():
+            if previous==current:continue
+            boundaries=sorted({boundary for item in [previous,current] if item for boundary in [item[0],item[1] or '9999-12-31']})
+            for first,last in zip(boundaries,boundaries[1:]):
+                active=lambda item:bool(item and item[0]<=first and (not item[1] or item[1]>first))
+                if active(previous)!=active(current):intervals.append((first,last))
+        merged=[]
+        for first,last in sorted(intervals):
+            if merged and first<=merged[-1][1]:merged[-1]=(merged[-1][0],max(last,merged[-1][1]))
+            else:merged.append((first,last))
+        for first,last in merged:
+            db.execute("""INSERT INTO indicator_dirty(indicator,date)
+                SELECT 'trin',date FROM breadth WHERE date>=? AND date<? GROUP BY date
+                ON CONFLICT(indicator,date) DO UPDATE SET not_before=0""",(first,last))
+
+    def replace_universe(self,records):
+        with self.connect() as db:
+            old={r['symbol']:(r['name'],r['ipo'],r['out_date']) for r in rows(db,'SELECT * FROM universe')}
+            self.save_delistings(db,(r for r in records if r.get('exchange_confirmed')))
+            confirmed={r['symbol']:r for r in db.execute('SELECT * FROM exchange_delistings')}
+            values={symbol:value for symbol,value in old.items() if value[2]}
+            for r in records:
+                symbol=r['code'];name=r['code_name']
+                stale=old.get(symbol)
+                ipo=listing_date(r.get('ipoDate')) or (stale[1] if stale else '')
+                if not ipo:continue
+                end=listing_date(r.get('outDate'))
+                notice=confirmed.get(symbol)
+                if notice and notice['out_date']>ipo:end=notice['out_date']
+                elif not end and stale and stale[2]>ipo:end=stale[2]
+                values[symbol]=(name,ipo,end if end>ipo else '')
+            for symbol,notice in confirmed.items():
+                if symbol not in values and notice['ipo'] and notice['ipo']<notice['out_date']:
+                    values[symbol]=(notice['name'],notice['ipo'],notice['out_date'])
             db.execute('DELETE FROM universe')
-            db.executemany('INSERT INTO universe VALUES(?,?,?,?)',values)
-            for symbol in old.keys() | new.keys():
-                previous,current=old.get(symbol),new.get(symbol)
-                if previous==current:continue
-                boundaries=sorted({boundary for item in [previous,current] if item for boundary in [item[0],item[1] or '9999-12-31']})
-                for first,last in zip(boundaries,boundaries[1:]):
-                    active=lambda item:bool(item and item[0]<=first and (not item[1] or item[1]>first))
-                    if active(previous)!=active(current):
-                        db.execute("INSERT OR IGNORE INTO indicator_dirty(indicator,date) SELECT 'trin',date FROM breadth WHERE date>=? AND date<? GROUP BY date",(first,last))
+            db.executemany('INSERT INTO universe VALUES(?,?,?,?)',((symbol,*value) for symbol,value in values.items()))
+            self.enqueue_listing_changes(db,{symbol:(old[symbol][1:] if symbol in old else None,values[symbol][1:] if symbol in values else None)
+                                             for symbol in old.keys() | values.keys()})
 
     def calendar_gaps(self,start,end):
         with self.connect() as db:present={r[0] for r in db.execute('SELECT date FROM calendar WHERE date BETWEEN ? AND ?',(start,end))}
@@ -724,6 +794,15 @@ class MarketService:
             with self.store.connect() as db:db.executemany('INSERT INTO calendar VALUES(?,?) ON CONFLICT(date) DO UPDATE SET trading=excluded.trading WHERE calendar.trading IS NOT excluded.trading',[(d,trading.get(d,0)) for d in days])
         if self.cancel.is_set():return
         expected,missing=self.store.history_gaps(start,end)
+        stock_failures=self.store.setting('history_stock_failures',default={})
+        if end>=str(now().date()-timedelta(days=30)) and len(missing)<=32:
+            exchanges={code[:2] for code in missing if valid_stock_code(code) and stock_failures.get(code,{}).get('daily',0)>=2}
+            for exchange in sorted(exchanges):
+                if self.cancel.is_set():return
+                try:self.store.refresh_delistings(exchange,self.request)
+                except MarketLimit as exc:
+                    if not exc.source:raise
+            if exchanges:expected,missing=self.store.history_gaps(start,end)
         missing=set(missing)
         self.update(total=len(expected),done=len(expected)-len(missing))
         # Publish usable cached inputs before deciding whether any network work
@@ -737,7 +816,6 @@ class MarketService:
             work_days=[day for day in work_days if self.store.history_gaps(day,day)[1]]
         if not work_days:return {'complete':True,'wait':30}
         failures=self.store.setting('history_failures',default={})
-        stock_failures=self.store.setting('history_stock_failures',default={})
         # Chunk keys survive changes to the selected overall range. Old failure
         # records still gate the first retry, but no longer stall unrelated years.
         old_key=lambda code:code+':'+start+':'+end
